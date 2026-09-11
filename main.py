@@ -7,7 +7,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from fastapi import FastAPI, Form, File, UploadFile, Request
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import FreeText
 
@@ -18,15 +18,14 @@ DB_NAME = "gestion_laboral.db"
 # ==========================================
 # CONFIGURACIÓN DEL SERVIDOR DE CORREO (SMTP)
 # ==========================================
-# Cambia estos datos por los de tu servidor de correo (ej: Gmail, Outlook, cPanel)
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USER = "gygrrhh35@gmail.com"       
-SMTP_PASSWORD = "Roro1991+" 
-EMAIL_SENDER_NAME = "Sistema de Gestión Laboral / RRHH"
+SMTP_USER = "gygrrhh35@gmail.com"
+SMTP_PASSWORD = "Roro1991+"
+EMAIL_SENDER_NAME = "Recursos Humanos / Sistema de Gestión Laboral"
 
 def enviar_correo(destinatario: str, asunto: str, cuerpo_html: str):
-    """Función auxiliar para el envío de correos electrónicos."""
+    """Función para el envío real de correos electrónicos a través del SMTP de RRHH."""
     if not destinatario or "@" not in destinatario:
         return False
     try:
@@ -34,17 +33,14 @@ def enviar_correo(destinatario: str, asunto: str, cuerpo_html: str):
         msg["From"] = f"{EMAIL_SENDER_NAME} <{SMTP_USER}>"
         msg["To"] = destinatario
         msg["Subject"] = asunto
-
         msg.attach(MIMEText(cuerpo_html, "html", "utf-8"))
-
-        # Descomenta las líneas de abajo una vez configuradas las credenciales SMTP reales:
-        # server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        # server.starttls()
-        # server.login(SMTP_USER, SMTP_PASSWORD)
-        # server.sendmail(SMTP_USER, destinatario, msg.as_string())
-        # server.quit()
-
-        print(f"[CORREO SIMULADO / ENVIADO] A: {destinatario} | Asunto: {asunto}")
+        
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, destinatario, msg.as_string())
+        server.quit()
+        print(f"[CORREO ENVIADO CON ÉXITO] A: {destinatario} | Asunto: {asunto}")
         return True
     except Exception as e:
         print(f"[ERROR CORREO] No se pudo enviar el mensaje a {destinatario}: {e}")
@@ -112,7 +108,7 @@ def init_db():
 
     cursor.execute("SELECT * FROM usuarios WHERE rut = 'admin'")
     if not cursor.fetchone():
-        cursor.execute("INSERT INTO usuarios (rut, nombre, email, clave, rol) VALUES ('admin', 'Administrador RRHH', 'admin@empresa.cl', 'admin123', 'admin')")
+        cursor.execute("INSERT INTO usuarios (rut, nombre, email, clave, rol) VALUES ('admin', 'Administrador RRHH', 'gygrrhh35@gmail.com', 'admin123', 'admin')")
     
     conn.commit()
     conn.close()
@@ -147,6 +143,71 @@ def agregar_sello_anulado(ruta_pdf, motivo, fecha_firma=None, codigo_verificacio
     writer.write(buffer)
     buffer.seek(0)
     return buffer
+
+# ==========================================
+# RUTAS API PARA EL EXPEDIENTE (CLASIFICACIÓN)
+# ==========================================
+@app.get("/api/trabajador/{rut}/expediente")
+async def obtener_expediente(rut: str):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut,))
+    trabajador = cursor.fetchone()
+    
+    cursor.execute("SELECT * FROM documentos WHERE rut_trabajador = ?", (rut,))
+    docs = cursor.fetchall()
+    conn.close()
+
+    if not trabajador:
+        return JSONResponse(content={"error": "Trabajador no encontrado"}, status_code=404)
+
+    contratos = []
+    liquidaciones = []
+    otros = []
+
+    for d in docs:
+        tipo_lower = d['tipo_documento'].lower()
+        item = {
+            "id": d['id'],
+            "tipo": d['tipo_documento'],
+            "nombre": d['nombre_archivo'],
+            "fecha": str(d['fecha_subida'])[:10],
+            "url": f"/descargar/{d['id']}"
+        }
+        
+        # Clasificación exacta por pestañas
+        if "liquidacion" in tipo_lower:
+            liquidaciones.append(item)
+        elif any(k in tipo_lower for k in ["contrato", "anexo", "reglamento", "charla", "epp"]):
+            contratos.append(item)
+        else:
+            otros.append(item)
+
+    return JSONResponse(content={
+        "rut": rut,
+        "nombre": trabajador['nombre'],
+        "contratos": contratos,
+        "liquidaciones": liquidaciones,
+        "otros": otros
+    })
+
+@app.get("/eliminar-documento-dt/{id_doc}", response_class=HTMLResponse)
+def eliminar_documento_dt_get(id_doc: int):
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT ruta_archivo FROM documentos WHERE id = ?", (id_doc,))
+        doc = cursor.fetchone()
+        if doc and os.path.exists(doc['ruta_archivo']):
+            os.remove(doc['ruta_archivo'])
+        cursor.execute("DELETE FROM firmas_documentos WHERE documento_id = ?", (id_doc,))
+        cursor.execute("DELETE FROM documentos WHERE id = ?", (id_doc,))
+        conn.commit()
+        conn.close()
+        return render_admin_dashboard("Documento eliminado correctamente")
+    except Exception as e:
+        conn.close()
+        return render_admin_dashboard(f"Error al eliminar documento: {str(e)}")
 
 # --- VISTA PANEL TRABAJADOR ---
 def render_worker_dashboard(user, mensaje=""):
@@ -268,7 +329,16 @@ def render_worker_dashboard(user, mensaje=""):
                         <input type="hidden" name="rut_trabajador" value="{user['rut']}">
                         <div class="col-md-5">
                             <label class="form-label small">Detalle / Tipo de Documento</label>
-                            <input type="text" name="tipo_documento" class="form-control form-control-sm" placeholder="Ej: Licencia Médica, Certificado, etc." required>
+                            <select name="tipo_documento" class="form-select form-select-sm" required>
+                                <option value="Carnet">Carnet</option>
+                                <option value="Certificado de Antecedentes">Certificado de Antecedentes</option>
+                                <option value="Certificado Médico">Certificado Médico</option>
+                                <option value="Currículum">Currículum</option>
+                                <option value="Certificado AFP">Certificado AFP</option>
+                                <option value="Certificado Fonasa">Certificado Fonasa</option>
+                                <option value="Certificado OS-10">Certificado OS-10</option>
+                                <option value="Otro Documento">Otro Documento</option>
+                            </select>
                         </div>
                         <div class="col-md-5">
                             <label class="form-label small">Archivo (PDF o Imagen)</label>
@@ -325,15 +395,21 @@ def render_admin_dashboard(mensaje=""):
     filas_trabajadores = ""
     for t in trabajadores:
         email_val = t['email'] if t['email'] else ''
+        rut_t = t['rut']
+        nombre_t = t['nombre']
+        
         filas_trabajadores += f"""
         <tr>
-            <td>{t['rut']}</td>
-            <td>{t['nombre']}</td>
+            <td>{rut_t}</td>
+            <td>{nombre_t}</td>
             <td>{email_val}</td>
             <td><code>{t['clave']}</code></td>
-            <td>
-                <button class='btn btn-sm btn-outline-warning me-1' data-bs-toggle='modal' data-bs-target='#editModal{t['id']}'>Editar / Restablecer</button>
-                <a href='/eliminar-trabajador/{t['id']}' class='btn btn-sm btn-outline-danger' onclick='return confirm("¿Eliminar este trabajador?")'>Eliminar</a>
+            <td style="white-space: nowrap;">
+                <button class='btn btn-sm btn-outline-warning me-1' data-bs-toggle='modal' data-bs-target='#editModal{t['id']}'>Editar</button>
+                <a href='/eliminar-trabajador/{t['id']}' class='btn btn-sm btn-outline-danger me-1' onclick='return confirm("¿Eliminar este trabajador?")'>Eliminar</a>
+                <button type='button' class='btn btn-sm btn-info text-white btn-expediente' data-rut='{rut_t}'>
+                    <i class="fas fa-folder-open"></i> Expediente
+                </button>
             </td>
         </tr>
 
@@ -341,14 +417,14 @@ def render_admin_dashboard(mensaje=""):
           <div class="modal-dialog">
             <div class="modal-content">
               <div class="modal-header">
-                <h5 class="modal-title fw-bold">Modificar Trabajador (RUT: {t['rut']})</h5>
+                <h5 class="modal-title fw-bold">Modificar Trabajador (RUT: {rut_t})</h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
               </div>
               <form action="/editar-trabajador/{t['id']}" method="post">
                   <div class="modal-body">
                     <div class="mb-3">
                         <label class="form-label small fw-bold">Nombre Completo</label>
-                        <input type="text" name="nombre" class="form-control" value="{t['nombre']}" required>
+                        <input type="text" name="nombre" class="form-control" value="{nombre_t}" required>
                     </div>
                     <div class="mb-3">
                         <label class="form-label small fw-bold">Correo Electrónico</label>
@@ -371,19 +447,22 @@ def render_admin_dashboard(mensaje=""):
 
     filas_docs_admin = ""
     for d in docs_admin:
+        doc_id = str(d['id'])
         if d['anulado']:
-            estado_firma = f"<span class='badge bg-danger'>Anulado</span><br><small class='text-muted'>Motivo: {d['motivo_anulacion']}</small>"
-            accion_anular = ""
-            btn_ver = f"<a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-danger' target='_blank'>Ver PDF Anulado</a>"
+            estado_firma = "<span class='badge bg-danger'>Anulado</span><br><small class='text-muted'>Motivo: " + (d['motivo_anulacion'] or "") + "</small>"
+            btn_ver = f"<a href='/descargar/{doc_id}' class='btn btn-sm btn-outline-danger' target='_blank'>Ver PDF Anulado</a>"
+            btn_accion_anular = ""
         elif d['estado']:
             fecha_fmt = str(d['fecha_firma'])[:16] if d['fecha_firma'] else ""
             estado_firma = f"<span class='badge bg-success'>Firmado ({fecha_fmt})<br><small>Cód: {d['codigo_verificacion']}</small></span>"
-            accion_anular = f"<button class='btn btn-sm btn-outline-danger ms-1' data-bs-toggle='modal' data-bs-target='#anularModal{d['id']}'>Anular</button>"
-            btn_ver = f"<a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver PDF</a>"
+            btn_ver = f"<a href='/descargar/{doc_id}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver PDF</a>"
+            btn_accion_anular = f"<button class='btn btn-sm btn-outline-danger ms-1' data-bs-toggle='modal' data-bs-target='#anularModal{doc_id}'>Anular</button>"
         else:
             estado_firma = "<span class='badge bg-warning text-dark'>Pendiente de Firma</span>"
-            accion_anular = f"<button class='btn btn-sm btn-outline-danger ms-1' data-bs-toggle='modal' data-bs-target='#anularModal{d['id']}'>Anular</button>"
-            btn_ver = f"<a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver PDF</a>"
+            btn_ver = f"<a href='/descargar/{doc_id}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver PDF</a>"
+            btn_accion_anular = f"<button class='btn btn-sm btn-outline-danger ms-1' data-bs-toggle='modal' data-bs-target='#anularModal{doc_id}'>Anular</button>"
+
+        btn_eliminar_dt = f"<a href='/eliminar-documento-dt/{doc_id}' class='btn btn-sm btn-danger ms-1' onclick='return confirm(\"¿Estás seguro de eliminar este documento?\")'>Eliminar</a>"
 
         filas_docs_admin += f"""
         <tr>
@@ -393,18 +472,19 @@ def render_admin_dashboard(mensaje=""):
             <td>{estado_firma}</td>
             <td>
                 {btn_ver}
-                {accion_anular}
+                {btn_accion_anular}
+                {btn_eliminar_dt}
             </td>
         </tr>
 
-        <div class="modal fade" id="anularModal{d['id']}" tabindex="-1" aria-hidden="true">
+        <div class="modal fade" id="anularModal{doc_id}" tabindex="-1" aria-hidden="true">
           <div class="modal-dialog">
             <div class="modal-content">
               <div class="modal-header bg-danger text-white">
                 <h5 class="modal-title fw-bold">Anular Documento</h5>
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
               </div>
-              <form action="/anular-documento/{d['id']}" method="post">
+              <form action="/anular-documento/{doc_id}" method="post">
                   <div class="modal-body">
                     <p class="small text-secondary">Indique la razón por la cual se anula este documento:</p>
                     <div class="mb-3">
@@ -437,8 +517,76 @@ def render_admin_dashboard(mensaje=""):
 
     alerta = f"<script>alert('{mensaje}');</script>" if mensaje else ""
 
+    seccion_expediente_inline = """
+    <div class="container bg-white p-4 rounded shadow mb-4" id="seccionExpedienteFicha">
+        <div class="mb-3">
+            <h5 class="fw-bold text-secondary mb-0"><i class="fas fa-folder-open me-2"></i>Expediente y Documentación por Trabajador</h5>
+        </div>
+        <hr>
+        
+        <div class="d-flex align-items-center mb-3 p-2 bg-light rounded border">
+            <div class="me-3 fs-3 text-secondary"><i class="fas fa-user-circle"></i></div>
+            <div>
+                <h6 class="mb-0 fw-bold" id="infoNombreTrabajador">Seleccione un trabajador de la nómina de arriba</h6>
+                <small class="text-muted" id="infoRutTrabajador">RUT: ---</small>
+            </div>
+        </div>
+
+        <ul class="nav nav-tabs mb-3" id="adminExpTabs" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="tab-contratos" data-bs-toggle="tab" data-bs-target="#pane-contratos" type="button" role="tab">1. Contratos y Legales</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="tab-liquidaciones" data-bs-toggle="tab" data-bs-target="#pane-liquidaciones" type="button" role="tab">2. Liquidaciones</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="tab-otros" data-bs-toggle="tab" data-bs-target="#pane-otros" type="button" role="tab">3. Otros Documentos (Antecedentes/Carnet)</button>
+            </li>
+        </ul>
+
+        <div class="tab-content border p-3 rounded bg-white" id="adminExpTabsContent">
+            <div class="tab-pane fade show active" id="pane-contratos" role="tabpanel"><div id="tablaContratosInline"><p class="text-muted text-center my-3">Haga clic en el botón "Expediente" de cualquier trabajador para ver sus documentos.</p></div></div>
+            <div class="tab-pane fade" id="pane-liquidaciones" role="tabpanel"><div id="tablaLiquidacionesInline" style="max-height:300px; overflow-y:auto;"></div></div>
+            <div class="tab-pane fade" id="pane-otros" role="tabpanel"><div id="tablaOtrosInline" style="max-height:300px; overflow-y:auto;"></div></div>
+        </div>
+    </div>
+    """
+
     js_script = """
         <script>
+        function cargarExpedienteInlineDirecto(rut) {
+            if(!rut) return;
+            fetch('/api/trabajador/' + encodeURIComponent(rut) + '/expediente')
+                .then(res => {
+                    if(!res.ok) throw new Error("Trabajador no encontrado");
+                    return res.json();
+                })
+                .then(data => {
+                    document.getElementById('infoNombreTrabajador').innerText = data.nombre;
+                    document.getElementById('infoRutTrabajador').innerText = 'RUT: ' + data.rut;
+
+                    let renderTabla = (items) => {
+                        if(items.length === 0) return '<p class="text-muted text-center my-3">No hay documentos registrados en esta sección.</p>';
+                        let html = '<table class="table table-striped table-sm align-middle mb-0"><thead><tr><th>Tipo / Detalle</th><th>Nombre Archivo</th><th>Fecha</th><th>Acción</th></tr></thead><tbody>';
+                        items.forEach(i => {
+                            html += <tr><td>${i.tipo}</td><td>${i.nombre}</td><td>${i.fecha}</td><td><a href="${i.url}" target="_blank" class="btn btn-sm btn-outline-primary"><i class="fas fa-file-pdf"></i> Ver PDF</a> <a href="${i.url}" download class="btn btn-sm btn-outline-success"><i class="fas fa-download"></i> Descargar</a></td></tr>;
+                        });
+                        html += '</tbody></table>';
+                        return html;
+                    };
+
+                    document.getElementById('tablaContratosInline').innerHTML = renderTabla(data.contratos);
+                    document.getElementById('tablaLiquidacionesInline').innerHTML = renderTabla(data.liquidaciones);
+                    document.getElementById('tablaOtrosInline').innerHTML = renderTabla(data.otros);
+                    
+                    document.getElementById('seccionExpedienteFicha').scrollIntoView({ behavior: 'smooth' });
+                })
+                .catch(err => {
+                    console.error(err);
+                    alert("No se pudo cargar la información del expediente.");
+                });
+        }
+
         $(document).ready(function() {
             var config = {
                 "pageLength": 10,
@@ -452,15 +600,29 @@ def render_admin_dashboard(mensaje=""):
                     "infoFiltered": "(filtrado de MAX registros totales)",
                     "search": "Buscar:",
                     "paginate": {
-                        "first": "«",
-                        "last": "»",
-                        "next": "›",
-                        "previous": "‹"
+                        "first": "Primero",
+                        "last": "Último",
+                        "next": "Siguiente",
+                        "previous": "Anterior"
                     }
                 }
             };
+            
+            if ($.fn.DataTable.isDataTable('#tablaTrabajadores')) {
+                $('#tablaTrabajadores').DataTable().destroy();
+            }
+            if ($.fn.DataTable.isDataTable('#tablaDocsAdmin')) {
+                $('#tablaDocsAdmin').DataTable().destroy();
+            }
+
             $('#tablaTrabajadores').DataTable(config);
             $('#tablaDocsAdmin').DataTable(config);
+
+            $(document).on('click', '.btn-expediente', function(e) {
+                e.preventDefault();
+                var rut = $(this).attr('data-rut');
+                cargarExpedienteInlineDirecto(rut);
+            });
         });
         </script>
     """
@@ -472,6 +634,7 @@ def render_admin_dashboard(mensaje=""):
         <meta charset="UTF-8">
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
         <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
         <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
@@ -504,14 +667,13 @@ def render_admin_dashboard(mensaje=""):
                         </div>
                         <div class="col-12">
                             <label class="form-label small">Contraseña Inicial</label>
-                            <input type="password" name="clave" class="form-control form-control-sm" placeholder="••••••••" required>
+                            <input type="password" name="clave" class="form-control form-control-sm" placeholder="......" required>
                         </div>
                         <div class="col-12 mt-3">
                             <button type="submit" class="btn btn-sm btn-primary w-100">Crear Trabajador</button>
                         </div>
                     </form>
                 </div>
-
                 <div class="col-md-6">
                     <h5 class="fw-bold mb-3 text-secondary">Enviar Documento a Firmar</h5>
                     <form action="/subir-documento-admin" method="post" enctype="multipart/form-data" class="row g-2">
@@ -522,14 +684,20 @@ def render_admin_dashboard(mensaje=""):
                         <div class="col-12">
                             <label class="form-label small">Tipo de Documento</label>
                             <select name="tipo_documento" class="form-select form-select-sm" required>
-                                <option value="Liquidación de Sueldo">Liquidación de Sueldo</option>
                                 <option value="Contrato de Trabajo">Contrato de Trabajo</option>
                                 <option value="Anexo de Contrato">Anexo de Contrato</option>
-                                <option value="Comprobante de Feriado Anual">Comprobante de Vacaciones</option>
-                                <option value="Entrega de EPP">Entrega de EPP</option>
+                                <option value="Reglamento Interno">Reglamento Interno</option>
                                 <option value="Charla DAS (Derecho a Saber)">Charla DAS (Derecho a Saber)</option>
-                                <option value="Entrega de Reglamento Interno">Entrega de Reglamento Interno</option>
-                                <option value="Conocimiento de Afiliación (Caja/Mutual)">Conocimiento de Afiliación (Caja/Mutual)</option>
+                                <option value="Entrega de EPP">Entrega de EPP</option>
+                                <option value="Liquidación de Sueldo">Liquidación de Sueldo</option>
+                                <option value="Carnet">Carnet</option>
+                                <option value="Certificado de Antecedentes">Certificado de Antecedentes</option>
+                                <option value="Certificado Médico">Certificado Médico</option>
+                                <option value="Currículum">Currículum</option>
+                                <option value="Certificado AFP">Certificado AFP</option>
+                                <option value="Certificado Fonasa">Certificado Fonasa</option>
+                                <option value="Certificado OS-10">Certificado OS-10</option>
+                                <option value="Otro Documento">Otro Documento</option>
                             </select>
                         </div>
                         <div class="col-12">
@@ -552,6 +720,8 @@ def render_admin_dashboard(mensaje=""):
             </table>
         </div>
 
+        {seccion_expediente_inline}
+
         <div class="container bg-white p-4 rounded shadow mb-4">
             <h5 class="fw-bold text-secondary mb-3">Control de Documentos Enviados a Firmar (DT)</h5>
             <table id="tablaDocsAdmin" class="table table-striped table-sm align-middle">
@@ -567,13 +737,14 @@ def render_admin_dashboard(mensaje=""):
                 <tbody>{filas_docs_trabajador if filas_docs_trabajador else '<tr><td colspan="5" class="text-center">Ningún trabajador ha subido documentos aún.</td></tr>'}</tbody>
             </table>
         </div>
-
         {js_script}
     </body>
     </html>
     """
 
-# --- RUTAS PRINCIPALES ---
+# ==========================================
+# RUTAS PRINCIPALES Y LOGIN
+# ==========================================
 @app.get("/", response_class=HTMLResponse)
 def login_page():
     return """
@@ -610,10 +781,8 @@ def login(rut: str = Form(...), clave: str = Form(...)):
     cursor.execute("SELECT * FROM usuarios WHERE rut = ? AND clave = ?", (rut, clave))
     user = cursor.fetchone()
     conn.close()
-
     if not user:
         return "<script>alert('Credenciales incorrectas'); window.location.href='/';</script>"
-
     if user['rol'] == 'admin':
         return render_admin_dashboard()
     else:
@@ -655,25 +824,18 @@ def cambiar_clave_trabajador(rut_trabajador: str = Form(...), nueva_clave: str =
     cursor = conn.cursor()
     cursor.execute("UPDATE usuarios SET clave = ? WHERE rut = ?", (nueva_clave, rut_trabajador))
     conn.commit()
-    
     cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
     user = cursor.fetchone()
     conn.close()
-
     return render_worker_dashboard(user, "Su contraseña ha sido actualizada con éxito")
 
-# ==========================================
-# ENVÍO DE DOCUMENTO POR RRHH Y NOTIFICACIÓN
-# ==========================================
 @app.post("/subir-documento-admin", response_class=HTMLResponse)
 def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
     if not os.path.exists("uploads"):
         os.makedirs("uploads")
-    
     ruta_destino = os.path.join("uploads", archivo.filename)
     with open(ruta_destino, "wb") as f:
         f.write(archivo.file.read())
-
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
@@ -681,12 +843,11 @@ def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str =
         VALUES (?, ?, ?, ?, 'admin')
     """, (rut_trabajador, tipo_documento, archivo.filename, ruta_destino))
     conn.commit()
-
-    # Obtener correo del trabajador para enviar aviso de documento pendiente
+    
     cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
     trabajador = cursor.fetchone()
     conn.close()
-
+    
     if trabajador and trabajador['email']:
         asunto = f"Nuevo documento pendiente de firma: {tipo_documento}"
         cuerpo = f"""
@@ -701,41 +862,35 @@ def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str =
         <small>Este es un correo automático, por favor no responder a esta dirección.</small>
         """
         enviar_correo(trabajador['email'], asunto, cuerpo)
-
+        
     return render_admin_dashboard("Documento subido y notificación enviada al trabajador")
 
 @app.post("/subir-documento-trabajador", response_class=HTMLResponse)
 def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
     if not os.path.exists("uploads"):
         os.makedirs("uploads")
-    
     ruta_destino = os.path.join("uploads", archivo.filename)
     with open(ruta_destino, "wb") as f:
         f.write(archivo.file.read())
-
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO documentos (rut_trabajador, tipo_documento, nombre_archivo, ruta_archivo, origen)
         VALUES (?, ?, ?, ?, 'trabajador')
     """, (rut_trabajador, tipo_documento, archivo.filename, ruta_destino))
-    
+    conn.commit()
     cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
     user = cursor.fetchone()
     conn.close()
-
     return render_worker_dashboard(user, "Documento subido con éxito")
 
-# ==========================================
-# FIRMA DE DOCUMENTO Y NOTIFICACIÓN AL TRABAJADOR
-# ==========================================
 @app.post("/firmar-documento/{doc_id}", response_class=HTMLResponse)
 def firmar_documento(doc_id: int, rut_trabajador: str = Form(...), request: Request = None):
     ip_origen = request.client.host if request else "127.0.0.1"
     fecha_hora_actual = datetime.now()
     fecha_fmt = fecha_hora_actual.strftime("%d/%m/%Y %H:%M:%S")
     codigo_verificacion = hashlib.sha256(f"{doc_id}-{rut_trabajador}-{fecha_hora_actual}".encode()).hexdigest()[:12].upper()
-
+    
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
@@ -743,16 +898,13 @@ def firmar_documento(doc_id: int, rut_trabajador: str = Form(...), request: Requ
         VALUES (?, ?, ?, ?, 1)
     """, (doc_id, rut_trabajador, ip_origen, codigo_verificacion))
     conn.commit()
-
-    # Obtener datos del documento y del trabajador para el comprobante
+    
     cursor.execute("SELECT * FROM documentos WHERE id = ?", (doc_id,))
     doc = cursor.fetchone()
-
     cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
     user = cursor.fetchone()
     conn.close()
-
-    # Enviar correo de comprobante de firma al trabajador
+    
     if user and user['email']:
         asunto = f"Comprobante de Firma Electrónica - {doc['tipo_documento'] if doc else 'Documento'}"
         cuerpo = f"""
@@ -771,7 +923,7 @@ def firmar_documento(doc_id: int, rut_trabajador: str = Form(...), request: Requ
         <small>Este es un correo generado automáticamente como respaldo de tu firma electrónica.</small>
         """
         enviar_correo(user['email'], asunto, cuerpo)
-
+        
     return render_worker_dashboard(user, f"Documento firmado electrónicamente (Código: {codigo_verificacion}). Se ha enviado un comprobante a tu correo.")
 
 @app.post("/anular-documento/{doc_id}", response_class=HTMLResponse)
@@ -793,8 +945,8 @@ def descargar_documento(doc_id: int):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT d.*, f.fecha_firma, f.codigo_verificacion 
-        FROM documentos d
-        LEFT JOIN firmas_documentos f ON d.id = f.documento_id
+        FROM documentos d 
+        LEFT JOIN firmas_documentos f ON d.id = f.documento_id 
         WHERE d.id = ?
     """, (doc_id,))
     doc = cursor.fetchone()
@@ -804,8 +956,8 @@ def descargar_documento(doc_id: int):
         if doc['anulado']:
             buffer_pdf = agregar_sello_anulado(
                 doc['ruta_archivo'], 
-                doc['motivo_anulacion'] or "Sin motivo especificado",
-                fecha_firma=doc['fecha_firma'],
+                doc['motivo_anulacion'] or "Sin motivo especificado", 
+                fecha_firma=doc['fecha_firma'], 
                 codigo_verificacion=doc['codigo_verificacion']
             )
             return StreamingResponse(
@@ -813,7 +965,5 @@ def descargar_documento(doc_id: int):
                 media_type="application/pdf", 
                 headers={"Content-Disposition": f"inline; filename=ANULADO_{doc['nombre_archivo']}"}
             )
-        
         return FileResponse(doc['ruta_archivo'], filename=doc['nombre_archivo'])
-
     return HTMLResponse("Archivo no encontrado", status_code=404)
