@@ -13,7 +13,10 @@ from pypdf.annotations import FreeText
 
 app = FastAPI()
 
-DB_NAME = "gestion_laboral.db"
+# Si estás usando el disco persistente en Render (/data), usamos la ruta segura.
+# Si estás probando en tu computador local, usa la carpeta local.
+DB_NAME = "/data/gestion_laboral.db" if os.path.exists("/data") else "gestion_laboral.db"
+UPLOAD_DIR = "/data/uploads" if os.path.exists("/data") else "uploads"
 
 # ==========================================
 # CONFIGURACIÓN DEL SERVIDOR DE CORREO (SMTP)
@@ -53,6 +56,7 @@ def get_db():
     return conn
 
 def init_db():
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
@@ -505,42 +509,6 @@ def render_admin_dashboard(mensaje=""):
 
     alerta = f"<script>alert('{mensaje}');</script>" if mensaje else ""
 
-    js_script = """
-        <script>
-        $(document).ready(function() {
-            var config = {
-                "pageLength": 10,
-                "lengthMenu": [[10, 25, 50, 100], [10, 25, 50, 100]],
-                "pagingType": "full_numbers",
-                "language": {
-                    "lengthMenu": "Resultados por página MENU",
-                    "zeroRecords": "No se encontraron registros",
-                    "info": "Mostrando página PAGE de PAGES",
-                    "infoEmpty": "Sin registros disponibles",
-                    "infoFiltered": "(filtrado de MAX registros totales)",
-                    "search": "Buscar:",
-                    "paginate": {
-                        "first": "Primero",
-                        "last": "Último",
-                        "next": "Siguiente",
-                        "previous": "Anterior"
-                    }
-                }
-            };
-            
-            if ($.fn.DataTable.isDataTable('#tablaTrabajadores')) {
-                $('#tablaTrabajadores').DataTable().destroy();
-            }
-            if ($.fn.DataTable.isDataTable('#tablaDocsAdmin')) {
-                $('#tablaDocsAdmin').DataTable().destroy();
-            }
-
-            $('#tablaTrabajadores').DataTable(config);
-            $('#tablaDocsAdmin').DataTable(config);
-        });
-        </script>
-    """
-
     return f"""
     <!DOCTYPE html>
     <html lang="es">
@@ -649,7 +617,12 @@ def render_admin_dashboard(mensaje=""):
                 <tbody>{filas_docs_trabajador if filas_docs_trabajador else '<tr><td colspan="5" class="text-center">Ningún trabajador ha subido documentos aún.</td></tr>'}</tbody>
             </table>
         </div>
-        {js_script}
+        <script>
+            $(document).ready(function() {{
+                $('#tablaTrabajadores').DataTable({{ language: {{ url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/es-CL.json' }} }});
+                $('#tablaDocsAdmin').DataTable({{ language: {{ url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/es-CL.json' }} }});
+            }});
+        </script>
     </body>
     </html>
     """
@@ -754,8 +727,8 @@ def cambiar_clave_trabajador(rut_trabajador: str = Form(...), nueva_clave: str =
 
 @app.post("/subir-documento-admin", response_class=HTMLResponse)
 async def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
-    os.makedirs("uploads", exist_ok=True)
-    ruta_destino = os.path.join("uploads", archivo.filename)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    ruta_destino = os.path.join(UPLOAD_DIR, archivo.filename)
     contenido = await archivo.read()
     with open(ruta_destino, "wb") as f:
         f.write(contenido)
@@ -793,8 +766,8 @@ async def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento:
 
 @app.post("/subir-documento-trabajador", response_class=HTMLResponse)
 async def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
-    os.makedirs("uploads", exist_ok=True)
-    ruta_destino = os.path.join("uploads", archivo.filename)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    ruta_destino = os.path.join(UPLOAD_DIR, archivo.filename)
     contenido = await archivo.read()
     with open(ruta_destino, "wb") as f:
         f.write(contenido)
@@ -893,7 +866,7 @@ def descargar_documento(doc_id: int):
 
     if doc and os.path.exists(doc['ruta_archivo']):
         buffer_pdf = agregar_sello_firma_y_anulado(
-            doc['ruta_archivo'], 
+            doc['ruta_archivo'],
             motivo_anulado=doc['motivo_anulacion'] if doc['anulado'] else None,
             fecha_anulacion=doc['fecha_anulacion'] if doc['anulado'] else None,
             nombre_firmante=doc['nombre_trabajador'] if doc['codigo_verificacion'] else None,
