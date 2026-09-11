@@ -25,7 +25,6 @@ SMTP_PASSWORD = "Roro1991+"
 EMAIL_SENDER_NAME = "Recursos Humanos / Sistema de Gestión Laboral"
 
 def enviar_correo(destinatario: str, asunto: str, cuerpo_html: str):
-    """Función para el envío real de correos electrónicos a través del SMTP de RRHH."""
     if not destinatario or "@" not in destinatario:
         return False
     try:
@@ -40,10 +39,9 @@ def enviar_correo(destinatario: str, asunto: str, cuerpo_html: str):
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_USER, destinatario, msg.as_string())
         server.quit()
-        print(f"[CORREO ENVIADO CON ÉXITO] A: {destinatario} | Asunto: {asunto}")
         return True
     except Exception as e:
-        print(f"[ERROR CORREO] No se pudo enviar el mensaje a {destinatario}: {e}")
+        print(f"[ERROR CORREO]: {e}")
         return False
 
 # ==========================================
@@ -115,7 +113,6 @@ def init_db():
 
 init_db()
 
-# --- FUNCIÓN AUXILIAR PARA ESTAMPAR SELLO EN PDF ---
 def agregar_sello_anulado(ruta_pdf, motivo, fecha_firma=None, codigo_verificacion=None):
     reader = PdfReader(ruta_pdf)
     writer = PdfWriter()
@@ -144,53 +141,6 @@ def agregar_sello_anulado(ruta_pdf, motivo, fecha_firma=None, codigo_verificacio
     buffer.seek(0)
     return buffer
 
-# ==========================================
-# RUTAS API PARA EL EXPEDIENTE (CLASIFICACIÓN)
-# ==========================================
-@app.get("/api/trabajador/{rut}/expediente")
-async def obtener_expediente(rut: str):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut,))
-    trabajador = cursor.fetchone()
-    
-    cursor.execute("SELECT * FROM documentos WHERE rut_trabajador = ?", (rut,))
-    docs = cursor.fetchall()
-    conn.close()
-
-    if not trabajador:
-        return JSONResponse(content={"error": "Trabajador no encontrado"}, status_code=404)
-
-    contratos = []
-    liquidaciones = []
-    otros = []
-
-    for d in docs:
-        tipo_lower = d['tipo_documento'].lower()
-        item = {
-            "id": d['id'],
-            "tipo": d['tipo_documento'],
-            "nombre": d['nombre_archivo'],
-            "fecha": str(d['fecha_subida'])[:10],
-            "url": f"/descargar/{d['id']}"
-        }
-        
-        # Clasificación exacta por pestañas
-        if "liquidacion" in tipo_lower:
-            liquidaciones.append(item)
-        elif any(k in tipo_lower for k in ["contrato", "anexo", "reglamento", "charla", "epp"]):
-            contratos.append(item)
-        else:
-            otros.append(item)
-
-    return JSONResponse(content={
-        "rut": rut,
-        "nombre": trabajador['nombre'],
-        "contratos": contratos,
-        "liquidaciones": liquidaciones,
-        "otros": otros
-    })
-
 @app.get("/eliminar-documento-dt/{id_doc}", response_class=HTMLResponse)
 def eliminar_documento_dt_get(id_doc: int):
     conn = get_db()
@@ -209,7 +159,23 @@ def eliminar_documento_dt_get(id_doc: int):
         conn.close()
         return render_admin_dashboard(f"Error al eliminar documento: {str(e)}")
 
-# --- VISTA PANEL TRABAJADOR ---
+@app.get("/eliminar-documento-trabajador/{id_doc}", response_class=HTMLResponse)
+def eliminar_documento_trabajador_get(id_doc: int):
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT ruta_archivo FROM documentos WHERE id = ?", (id_doc,))
+        doc = cursor.fetchone()
+        if doc and os.path.exists(doc['ruta_archivo']):
+            os.remove(doc['ruta_archivo'])
+        cursor.execute("DELETE FROM documentos WHERE id = ?", (id_doc,))
+        conn.commit()
+        conn.close()
+        return render_admin_dashboard("Documento subido por trabajador eliminado correctamente")
+    except Exception as e:
+        conn.close()
+        return render_admin_dashboard(f"Error al eliminar documento: {str(e)}")
+
 def render_worker_dashboard(user, mensaje=""):
     conn = get_db()
     cursor = conn.cursor()
@@ -297,7 +263,6 @@ def render_worker_dashboard(user, mensaje=""):
             </div>
             <hr>
 
-            <!-- Modal Cambiar Contraseña -->
             <div class="modal fade" id="modalClave" tabindex="-1" aria-hidden="true">
               <div class="modal-dialog">
                 <div class="modal-content">
@@ -367,7 +332,6 @@ def render_worker_dashboard(user, mensaje=""):
     </html>
     """
 
-# --- VISTA PANEL ADMIN ---
 def render_admin_dashboard(mensaje=""):
     conn = get_db()
     cursor = conn.cursor()
@@ -398,58 +362,56 @@ def render_admin_dashboard(mensaje=""):
         rut_t = t['rut']
         nombre_t = t['nombre']
         
-        filas_trabajadores += f"""
-        <tr>
-            <td>{rut_t}</td>
-            <td>{nombre_t}</td>
-            <td>{email_val}</td>
-            <td><code>{t['clave']}</code></td>
-            <td style="white-space: nowrap;">
-                <button class='btn btn-sm btn-outline-warning me-1' data-bs-toggle='modal' data-bs-target='#editModal{t['id']}'>Editar</button>
-                <a href='/eliminar-trabajador/{t['id']}' class='btn btn-sm btn-outline-danger me-1' onclick='return confirm("¿Eliminar este trabajador?")'>Eliminar</a>
-                <button type='button' class='btn btn-sm btn-info text-white btn-expediente' data-rut='{rut_t}'>
-                    <i class="fas fa-folder-open"></i> Expediente
-                </button>
-            </td>
-        </tr>
-
-        <div class="modal fade" id="editModal{t['id']}" tabindex="-1" aria-hidden="true">
-          <div class="modal-dialog">
-            <div class="modal-content">
-              <div class="modal-header">
-                <h5 class="modal-title fw-bold">Modificar Trabajador (RUT: {rut_t})</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        filas_trabajadores += (
+            "<tr>"
+            f"<td>{rut_t}</td>"
+            f"<td>{nombre_t}</td>"
+            f"<td>{email_val}</td>"
+            f"<td><code>{t['clave']}</code></td>"
+            f"<td style='white-space: nowrap;'>"
+            f"<button class='btn btn-sm btn-outline-warning me-1' data-bs-toggle='modal' data-bs-target='#editModal{t['id']}'>Editar</button>"
+            f"<a href='/eliminar-trabajador/{t['id']}' class='btn btn-sm btn-outline-danger' onclick='return confirm(\"¿Eliminar este trabajador?\")'>Eliminar</a>"
+            "</td>"
+            "</tr>"
+            f"""
+            <div class="modal fade" id="editModal{t['id']}" tabindex="-1" aria-hidden="true">
+              <div class="modal-dialog">
+                <div class="modal-content">
+                  <div class="modal-header">
+                    <h5 class="modal-title fw-bold">Modificar Trabajador (RUT: {rut_t})</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                  </div>
+                  <form action="/editar-trabajador/{t['id']}" method="post">
+                      <div class="modal-body">
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold">Nombre Completo</label>
+                            <input type="text" name="nombre" class="form-control" value="{nombre_t}" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold">Correo Electrónico</label>
+                            <input type="email" name="email" class="form-control" value="{email_val}" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold">Nueva Contraseña (Restablecer)</label>
+                            <input type="text" name="clave" class="form-control" value="{t['clave']}" required>
+                        </div>
+                      </div>
+                      <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancelar</button>
+                        <button type="submit" class="btn btn-primary btn-sm">Guardar Cambios</button>
+                      </div>
+                  </form>
+                </div>
               </div>
-              <form action="/editar-trabajador/{t['id']}" method="post">
-                  <div class="modal-body">
-                    <div class="mb-3">
-                        <label class="form-label small fw-bold">Nombre Completo</label>
-                        <input type="text" name="nombre" class="form-control" value="{nombre_t}" required>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label small fw-bold">Correo Electrónico</label>
-                        <input type="email" name="email" class="form-control" value="{email_val}" required>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label small fw-bold">Nueva Contraseña (Restablecer)</label>
-                        <input type="text" name="clave" class="form-control" value="{t['clave']}" required>
-                    </div>
-                  </div>
-                  <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancelar</button>
-                    <button type="submit" class="btn btn-primary btn-sm">Guardar Cambios</button>
-                  </div>
-              </form>
             </div>
-          </div>
-        </div>
-        """
+            """
+        )
 
     filas_docs_admin = ""
     for d in docs_admin:
         doc_id = str(d['id'])
         if d['anulado']:
-            estado_firma = "<span class='badge bg-danger'>Anulado</span><br><small class='text-muted'>Motivo: " + (d['motivo_anulacion'] or "") + "</small>"
+            estado_firma = f"<span class='badge bg-danger'>Anulado</span><br><small class='text-muted'>Motivo: {d['motivo_anulacion'] or ''}</small>"
             btn_ver = f"<a href='/descargar/{doc_id}' class='btn btn-sm btn-outline-danger' target='_blank'>Ver PDF Anulado</a>"
             btn_accion_anular = ""
         elif d['estado']:
@@ -464,43 +426,40 @@ def render_admin_dashboard(mensaje=""):
 
         btn_eliminar_dt = f"<a href='/eliminar-documento-dt/{doc_id}' class='btn btn-sm btn-danger ms-1' onclick='return confirm(\"¿Estás seguro de eliminar este documento?\")'>Eliminar</a>"
 
-        filas_docs_admin += f"""
-        <tr>
-            <td>{d['rut_trabajador']}</td>
-            <td>{d['tipo_documento']}</td>
-            <td>{d['nombre_archivo']}</td>
-            <td>{estado_firma}</td>
-            <td>
-                {btn_ver}
-                {btn_accion_anular}
-                {btn_eliminar_dt}
-            </td>
-        </tr>
-
-        <div class="modal fade" id="anularModal{doc_id}" tabindex="-1" aria-hidden="true">
-          <div class="modal-dialog">
-            <div class="modal-content">
-              <div class="modal-header bg-danger text-white">
-                <h5 class="modal-title fw-bold">Anular Documento</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+        filas_docs_admin += (
+            "<tr>"
+            f"<td>{d['rut_trabajador']}</td>"
+            f"<td>{d['tipo_documento']}</td>"
+            f"<td>{d['nombre_archivo']}</td>"
+            f"<td>{estado_firma}</td>"
+            f"<td>{btn_ver} {btn_accion_anular} {btn_eliminar_dt}</td>"
+            "</tr>"
+            f"""
+            <div class="modal fade" id="anularModal{doc_id}" tabindex="-1" aria-hidden="true">
+              <div class="modal-dialog">
+                <div class="modal-content">
+                  <div class="modal-header bg-danger text-white">
+                    <h5 class="modal-title fw-bold">Anular Documento</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                  </div>
+                  <form action="/anular-documento/{doc_id}" method="post">
+                      <div class="modal-body">
+                        <p class="small text-secondary">Indique la razón por la cual se anula este documento:</p>
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold">Motivo de Anulación</label>
+                            <textarea name="motivo" class="form-control" rows="3" placeholder="Escriba el motivo..." required></textarea>
+                        </div>
+                      </div>
+                      <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancelar</button>
+                        <button type="submit" class="btn btn-danger btn-sm">Confirmar Anulación</button>
+                      </div>
+                  </form>
+                </div>
               </div>
-              <form action="/anular-documento/{doc_id}" method="post">
-                  <div class="modal-body">
-                    <p class="small text-secondary">Indique la razón por la cual se anula este documento:</p>
-                    <div class="mb-3">
-                        <label class="form-label small fw-bold">Motivo de Anulación</label>
-                        <textarea name="motivo" class="form-control" rows="3" placeholder="Escriba el motivo..." required></textarea>
-                    </div>
-                  </div>
-                  <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancelar</button>
-                    <button type="submit" class="btn btn-danger btn-sm">Confirmar Anulación</button>
-                  </div>
-              </form>
             </div>
-          </div>
-        </div>
-        """
+            """
+        )
 
     filas_docs_trabajador = ""
     for d in docs_trabajador:
@@ -511,82 +470,17 @@ def render_admin_dashboard(mensaje=""):
             <td>{d['tipo_documento']}</td>
             <td>{d['nombre_archivo']}</td>
             <td>{fecha_sub}</td>
-            <td><a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-primary' target='_blank'>Descargar / Ver</a></td>
+            <td>
+                <a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-primary me-1' target='_blank'>Descargar / Ver</a>
+                <a href='/eliminar-documento-trabajador/{d['id']}' class='btn btn-sm btn-danger' onclick='return confirm(\"¿Estás seguro de eliminar este documento?\")'>Eliminar</a>
+            </td>
         </tr>
         """
 
     alerta = f"<script>alert('{mensaje}');</script>" if mensaje else ""
 
-    seccion_expediente_inline = """
-    <div class="container bg-white p-4 rounded shadow mb-4" id="seccionExpedienteFicha">
-        <div class="mb-3">
-            <h5 class="fw-bold text-secondary mb-0"><i class="fas fa-folder-open me-2"></i>Expediente y Documentación por Trabajador</h5>
-        </div>
-        <hr>
-        
-        <div class="d-flex align-items-center mb-3 p-2 bg-light rounded border">
-            <div class="me-3 fs-3 text-secondary"><i class="fas fa-user-circle"></i></div>
-            <div>
-                <h6 class="mb-0 fw-bold" id="infoNombreTrabajador">Seleccione un trabajador de la nómina de arriba</h6>
-                <small class="text-muted" id="infoRutTrabajador">RUT: ---</small>
-            </div>
-        </div>
-
-        <ul class="nav nav-tabs mb-3" id="adminExpTabs" role="tablist">
-            <li class="nav-item" role="presentation">
-                <button class="nav-link active" id="tab-contratos" data-bs-toggle="tab" data-bs-target="#pane-contratos" type="button" role="tab">1. Contratos y Legales</button>
-            </li>
-            <li class="nav-item" role="presentation">
-                <button class="nav-link" id="tab-liquidaciones" data-bs-toggle="tab" data-bs-target="#pane-liquidaciones" type="button" role="tab">2. Liquidaciones</button>
-            </li>
-            <li class="nav-item" role="presentation">
-                <button class="nav-link" id="tab-otros" data-bs-toggle="tab" data-bs-target="#pane-otros" type="button" role="tab">3. Otros Documentos (Antecedentes/Carnet)</button>
-            </li>
-        </ul>
-
-        <div class="tab-content border p-3 rounded bg-white" id="adminExpTabsContent">
-            <div class="tab-pane fade show active" id="pane-contratos" role="tabpanel"><div id="tablaContratosInline"><p class="text-muted text-center my-3">Haga clic en el botón "Expediente" de cualquier trabajador para ver sus documentos.</p></div></div>
-            <div class="tab-pane fade" id="pane-liquidaciones" role="tabpanel"><div id="tablaLiquidacionesInline" style="max-height:300px; overflow-y:auto;"></div></div>
-            <div class="tab-pane fade" id="pane-otros" role="tabpanel"><div id="tablaOtrosInline" style="max-height:300px; overflow-y:auto;"></div></div>
-        </div>
-    </div>
-    """
-
     js_script = """
         <script>
-        function cargarExpedienteInlineDirecto(rut) {
-            if(!rut) return;
-            fetch('/api/trabajador/' + encodeURIComponent(rut) + '/expediente')
-                .then(res => {
-                    if(!res.ok) throw new Error("Trabajador no encontrado");
-                    return res.json();
-                })
-                .then(data => {
-                    document.getElementById('infoNombreTrabajador').innerText = data.nombre;
-                    document.getElementById('infoRutTrabajador').innerText = 'RUT: ' + data.rut;
-
-                    let renderTabla = (items) => {
-                        if(items.length === 0) return '<p class="text-muted text-center my-3">No hay documentos registrados en esta sección.</p>';
-                        let html = '<table class="table table-striped table-sm align-middle mb-0"><thead><tr><th>Tipo / Detalle</th><th>Nombre Archivo</th><th>Fecha</th><th>Acción</th></tr></thead><tbody>';
-                        items.forEach(i => {
-                            html += <tr><td>${i.tipo}</td><td>${i.nombre}</td><td>${i.fecha}</td><td><a href="${i.url}" target="_blank" class="btn btn-sm btn-outline-primary"><i class="fas fa-file-pdf"></i> Ver PDF</a> <a href="${i.url}" download class="btn btn-sm btn-outline-success"><i class="fas fa-download"></i> Descargar</a></td></tr>;
-                        });
-                        html += '</tbody></table>';
-                        return html;
-                    };
-
-                    document.getElementById('tablaContratosInline').innerHTML = renderTabla(data.contratos);
-                    document.getElementById('tablaLiquidacionesInline').innerHTML = renderTabla(data.liquidaciones);
-                    document.getElementById('tablaOtrosInline').innerHTML = renderTabla(data.otros);
-                    
-                    document.getElementById('seccionExpedienteFicha').scrollIntoView({ behavior: 'smooth' });
-                })
-                .catch(err => {
-                    console.error(err);
-                    alert("No se pudo cargar la información del expediente.");
-                });
-        }
-
         $(document).ready(function() {
             var config = {
                 "pageLength": 10,
@@ -617,12 +511,6 @@ def render_admin_dashboard(mensaje=""):
 
             $('#tablaTrabajadores').DataTable(config);
             $('#tablaDocsAdmin').DataTable(config);
-
-            $(document).on('click', '.btn-expediente', function(e) {
-                e.preventDefault();
-                var rut = $(this).attr('data-rut');
-                cargarExpedienteInlineDirecto(rut);
-            });
         });
         </script>
     """
@@ -720,8 +608,6 @@ def render_admin_dashboard(mensaje=""):
             </table>
         </div>
 
-        {seccion_expediente_inline}
-
         <div class="container bg-white p-4 rounded shadow mb-4">
             <h5 class="fw-bold text-secondary mb-3">Control de Documentos Enviados a Firmar (DT)</h5>
             <table id="tablaDocsAdmin" class="table table-striped table-sm align-middle">
@@ -730,7 +616,7 @@ def render_admin_dashboard(mensaje=""):
             </table>
         </div>
 
-        <div class="container bg-white p-4 rounded shadow">
+        <div class="container bg-white p-4 rounded shadow" id="seccionDocumentosLibres">
             <h5 class="fw-bold text-secondary mb-3">Documentos Subidos Libremente por los Trabajadores</h5>
             <table class="table table-striped table-sm align-middle">
                 <thead><tr><th>RUT Trabajador</th><th>Detalle / Tipo</th><th>Nombre Archivo</th><th>Fecha Subida</th><th>Acción</th></tr></thead>
@@ -742,9 +628,6 @@ def render_admin_dashboard(mensaje=""):
     </html>
     """
 
-# ==========================================
-# RUTAS PRINCIPALES Y LOGIN
-# ==========================================
 @app.get("/", response_class=HTMLResponse)
 def login_page():
     return """
@@ -830,12 +713,13 @@ def cambiar_clave_trabajador(rut_trabajador: str = Form(...), nueva_clave: str =
     return render_worker_dashboard(user, "Su contraseña ha sido actualizada con éxito")
 
 @app.post("/subir-documento-admin", response_class=HTMLResponse)
-def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
-    if not os.path.exists("uploads"):
-        os.makedirs("uploads")
+async def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
+    os.makedirs("uploads", exist_ok=True)
     ruta_destino = os.path.join("uploads", archivo.filename)
+    contenido = await archivo.read()
     with open(ruta_destino, "wb") as f:
-        f.write(archivo.file.read())
+        f.write(contenido)
+    
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
@@ -866,12 +750,13 @@ def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str =
     return render_admin_dashboard("Documento subido y notificación enviada al trabajador")
 
 @app.post("/subir-documento-trabajador", response_class=HTMLResponse)
-def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
-    if not os.path.exists("uploads"):
-        os.makedirs("uploads")
+async def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
+    os.makedirs("uploads", exist_ok=True)
     ruta_destino = os.path.join("uploads", archivo.filename)
+    contenido = await archivo.read()
     with open(ruta_destino, "wb") as f:
-        f.write(archivo.file.read())
+        f.write(contenido)
+        
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
