@@ -5,7 +5,7 @@ import io
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Form, File, UploadFile, Request
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
 from pypdf import PdfReader, PdfWriter
@@ -21,7 +21,7 @@ DB_NAME = "gestion_laboral.db"
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "gygrrhh35@gmail.com"
-SMTP_PASSWORD = "Roro1991+"
+SMTP_PASSWORD = "sacxkwazjvdgdwgn"
 EMAIL_SENDER_NAME = "Recursos Humanos / Sistema de Gestión Laboral"
 
 def enviar_correo(destinatario: str, asunto: str, cuerpo_html: str):
@@ -48,7 +48,7 @@ def enviar_correo(destinatario: str, asunto: str, cuerpo_html: str):
 # BASE DE DATOS E INICIALIZACIÓN
 # ==========================================
 def get_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -75,7 +75,8 @@ def init_db():
             origen TEXT NOT NULL,
             fecha_subida TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             anulado INTEGER DEFAULT 0,
-            motivo_anulacion TEXT
+            motivo_anulacion TEXT,
+            fecha_anulacion TIMESTAMP
         )
     """)
     cursor.execute("""
@@ -103,6 +104,10 @@ def init_db():
         cursor.execute("ALTER TABLE documentos ADD COLUMN motivo_anulacion TEXT")
     except sqlite3.OperationalError:
         pass
+    try:
+        cursor.execute("ALTER TABLE documentos ADD COLUMN fecha_anulacion TIMESTAMP")
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute("SELECT * FROM usuarios WHERE rut = 'admin'")
     if not cursor.fetchone():
@@ -113,28 +118,48 @@ def init_db():
 
 init_db()
 
-def agregar_sello_anulado(ruta_pdf, motivo, fecha_firma=None, codigo_verificacion=None):
+def obtener_hora_chile():
+    utc_now = datetime.now(timezone.utc)
+    chile_time = utc_now - timedelta(hours=3)
+    return chile_time.replace(tzinfo=None)
+
+def agregar_sello_firma_y_anulado(ruta_pdf, motivo_anulado=None, fecha_anulacion=None, nombre_firmante=None, rut_firmante=None, fecha_firma=None, codigo_verificacion=None):
     reader = PdfReader(ruta_pdf)
     writer = PdfWriter()
 
-    linea_firma = ""
-    if fecha_firma and codigo_verificacion:
-        fecha_str = str(fecha_firma)[:16]
-        linea_firma = f"Firmado ({fecha_str})\nCód: {codigo_verificacion}\n"
-
-    texto_sello = f"{linea_firma}ANULADO\nMotivo: {motivo}"
-
-    for page in reader.pages:
-        anotacion = FreeText(
-            text=texto_sello,
-            rect=(370, 680, 570, 770),
-            font_size="9pt",
-            font_color="D9534F",
-            border_color="D9534F",
-            background_color="FDF2F2"
-        )
+    for index, page in enumerate(reader.pages):
         writer.add_page(page)
-        writer.add_annotation(page_number=len(writer.pages) - 1, annotation=anotacion)
+        page_num = len(writer.pages) - 1
+
+        if nombre_firmante and rut_firmante and fecha_firma and codigo_verificacion:
+            fecha_str = str(fecha_firma)[:19]
+            texto_firma = (
+                f"FIRMADO DIGITALMENTE POR: {nombre_firmante} (RUT: {rut_firmante})\n"
+                f"FECHA DE FIRMA: {fecha_str}\n"
+                f"CÓDIGO DE VERIFICACIÓN: FIRMA-{codigo_verificacion}"
+            )
+            anotacion_firma = FreeText(
+                text=texto_firma,
+                rect=(50, 50, 450, 110),
+                font_size="8pt",
+                font_color="1B4F72",
+                border_color="2E86C1",
+                background_color="EBF5FB"
+            )
+            writer.add_annotation(page_number=page_num, annotation=anotacion_firma)
+
+        if motivo_anulado:
+            fecha_anul_str = str(fecha_anulacion)[:19] if fecha_anulacion else ""
+            texto_sello = f"DOCUMENTO ANULADO\nFECHA: {fecha_anul_str}\nMOTIVO: {motivo_anulado}"
+            anotacion_anulado = FreeText(
+                text=texto_sello,
+                rect=(320, 250, 570, 600),
+                font_size="24pt",
+                font_color="D9534F",
+                border_color="D9534F",
+                background_color="FDF2F2"
+            )
+            writer.add_annotation(page_number=page_num, annotation=anotacion_anulado)
 
     buffer = io.BytesIO()
     writer.write(buffer)
@@ -153,11 +178,11 @@ def eliminar_documento_dt_get(id_doc: int):
         cursor.execute("DELETE FROM firmas_documentos WHERE documento_id = ?", (id_doc,))
         cursor.execute("DELETE FROM documentos WHERE id = ?", (id_doc,))
         conn.commit()
-        conn.close()
         return render_admin_dashboard("Documento eliminado correctamente")
     except Exception as e:
-        conn.close()
         return render_admin_dashboard(f"Error al eliminar documento: {str(e)}")
+    finally:
+        conn.close()
 
 @app.get("/eliminar-documento-trabajador/{id_doc}", response_class=HTMLResponse)
 def eliminar_documento_trabajador_get(id_doc: int):
@@ -170,33 +195,33 @@ def eliminar_documento_trabajador_get(id_doc: int):
             os.remove(doc['ruta_archivo'])
         cursor.execute("DELETE FROM documentos WHERE id = ?", (id_doc,))
         conn.commit()
-        conn.close()
         return render_admin_dashboard("Documento subido por trabajador eliminado correctamente")
     except Exception as e:
-        conn.close()
         return render_admin_dashboard(f"Error al eliminar documento: {str(e)}")
+    finally:
+        conn.close()
 
 def render_worker_dashboard(user, mensaje=""):
     conn = get_db()
     cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT d.*, f.fecha_firma, f.codigo_verificacion, f.estado 
-        FROM documentos d 
-        LEFT JOIN firmas_documentos f ON d.id = f.documento_id 
-        WHERE d.rut_trabajador = ? AND d.origen = 'admin'
-        ORDER BY d.id DESC
-    """, (user['rut'],))
-    docs_pendientes = cursor.fetchall()
+    try:
+        cursor.execute("""
+            SELECT d.*, f.fecha_firma, f.codigo_verificacion, f.estado 
+            FROM documentos d 
+            LEFT JOIN firmas_documentos f ON d.id = f.documento_id 
+            WHERE d.rut_trabajador = ? AND d.origen = 'admin'
+            ORDER BY d.id DESC
+        """, (user['rut'],))
+        docs_pendientes = cursor.fetchall()
 
-    cursor.execute("""
-        SELECT * FROM documentos 
-        WHERE rut_trabajador = ? AND origen = 'trabajador'
-        ORDER BY id DESC
-    """, (user['rut'],))
-    mis_subidas = cursor.fetchall()
-
-    conn.close()
+        cursor.execute("""
+            SELECT * FROM documentos 
+            WHERE rut_trabajador = ? AND origen = 'trabajador'
+            ORDER BY id DESC
+        """, (user['rut'],))
+        mis_subidas = cursor.fetchall()
+    finally:
+        conn.close()
 
     filas_por_firmar = ""
     for d in docs_pendientes:
@@ -205,7 +230,7 @@ def render_worker_dashboard(user, mensaje=""):
             accion = f"<a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-danger' target='_blank'>Ver Documento Anulado</a>"
         elif d['estado']:
             estado = f"<span class='badge bg-success'>Firmado ({str(d['fecha_firma'])[:16]})</span>"
-            accion = f"<a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver Documento</a>"
+            accion = f"<a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver Documento Firmado</a>"
         else:
             estado = "<span class='badge bg-warning text-dark'>Pendiente de Firma</span>"
             accion = f"""
@@ -335,26 +360,27 @@ def render_worker_dashboard(user, mensaje=""):
 def render_admin_dashboard(mensaje=""):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM usuarios WHERE rol = 'trabajador' ORDER BY id DESC")
-    trabajadores = cursor.fetchall()
-    
-    cursor.execute("""
-        SELECT d.*, f.fecha_firma, f.ip_origen, f.estado, f.codigo_verificacion 
-        FROM documentos d 
-        LEFT JOIN firmas_documentos f ON d.id = f.documento_id 
-        WHERE d.origen = 'admin'
-        ORDER BY d.id DESC
-    """)
-    docs_admin = cursor.fetchall()
+    try:
+        cursor.execute("SELECT * FROM usuarios WHERE rol = 'trabajador' ORDER BY id DESC")
+        trabajadores = cursor.fetchall()
+        
+        cursor.execute("""
+            SELECT d.*, f.fecha_firma, f.ip_origen, f.estado, f.codigo_verificacion 
+            FROM documentos d 
+            LEFT JOIN firmas_documentos f ON d.id = f.documento_id 
+            WHERE d.origen = 'admin'
+            ORDER BY d.id DESC
+        """)
+        docs_admin = cursor.fetchall()
 
-    cursor.execute("""
-        SELECT * FROM documentos 
-        WHERE origen = 'trabajador' 
-        ORDER BY id DESC
-    """)
-    docs_trabajador = cursor.fetchall()
-
-    conn.close()
+        cursor.execute("""
+            SELECT * FROM documentos 
+            WHERE origen = 'trabajador' 
+            ORDER BY id DESC
+        """)
+        docs_trabajador = cursor.fetchall()
+    finally:
+        conn.close()
 
     filas_trabajadores = ""
     for t in trabajadores:
@@ -616,7 +642,7 @@ def render_admin_dashboard(mensaje=""):
             </table>
         </div>
 
-        <div class="container bg-white p-4 rounded shadow" id="seccionDocumentosLibres">
+        <div class="container bg-white p-4 rounded shadow">
             <h5 class="fw-bold text-secondary mb-3">Documentos Subidos Libremente por los Trabajadores</h5>
             <table class="table table-striped table-sm align-middle">
                 <thead><tr><th>RUT Trabajador</th><th>Detalle / Tipo</th><th>Nombre Archivo</th><th>Fecha Subida</th><th>Acción</th></tr></thead>
@@ -661,9 +687,12 @@ def login_page():
 def login(rut: str = Form(...), clave: str = Form(...)):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM usuarios WHERE rut = ? AND clave = ?", (rut, clave))
-    user = cursor.fetchone()
-    conn.close()
+    try:
+        cursor.execute("SELECT * FROM usuarios WHERE rut = ? AND clave = ?", (rut, clave))
+        user = cursor.fetchone()
+    finally:
+        conn.close()
+
     if not user:
         return "<script>alert('Credenciales incorrectas'); window.location.href='/';</script>"
     if user['rol'] == 'admin':
@@ -673,43 +702,54 @@ def login(rut: str = Form(...), clave: str = Form(...)):
 
 @app.post("/crear-trabajador", response_class=HTMLResponse)
 def crear_trabajador(rut: str = Form(...), nombre: str = Form(...), email: str = Form(...), clave: str = Form(...)):
+    conn = get_db()
+    cursor = conn.cursor()
     try:
-        conn = get_db()
-        cursor = conn.cursor()
         cursor.execute("INSERT INTO usuarios (rut, nombre, email, clave, rol) VALUES (?, ?, ?, ?, 'trabajador')", (rut, nombre, email, clave))
         conn.commit()
-        conn.close()
         return render_admin_dashboard("Trabajador creado exitosamente")
     except Exception as e:
         return render_admin_dashboard(f"Error al crear trabajador: {str(e)}")
+    finally:
+        conn.close()
 
 @app.get("/eliminar-trabajador/{user_id}", response_class=HTMLResponse)
 def eliminar_trabajador(user_id: int):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM usuarios WHERE id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    return render_admin_dashboard("Trabajador eliminado exitosamente")
+    try:
+        cursor.execute("DELETE FROM usuarios WHERE id = ?", (user_id,))
+        conn.commit()
+        return render_admin_dashboard("Trabajador eliminado exitosamente")
+    except Exception as e:
+        return render_admin_dashboard(f"Error al eliminar trabajador: {str(e)}")
+    finally:
+        conn.close()
 
 @app.post("/editar-trabajador/{user_id}", response_class=HTMLResponse)
 def editar_trabajador(user_id: int, nombre: str = Form(...), email: str = Form(...), clave: str = Form(...)):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE usuarios SET nombre = ?, email = ?, clave = ? WHERE id = ?", (nombre, email, clave, user_id))
-    conn.commit()
-    conn.close()
-    return render_admin_dashboard("Datos y/o contraseña de trabajador actualizados")
+    try:
+        cursor.execute("UPDATE usuarios SET nombre = ?, email = ?, clave = ? WHERE id = ?", (nombre, email, clave, user_id))
+        conn.commit()
+        return render_admin_dashboard("Datos y/o contraseña de trabajador actualizados")
+    except Exception as e:
+        return render_admin_dashboard(f"Error al actualizar trabajador: {str(e)}")
+    finally:
+        conn.close()
 
 @app.post("/cambiar-clave-trabajador", response_class=HTMLResponse)
 def cambiar_clave_trabajador(rut_trabajador: str = Form(...), nueva_clave: str = Form(...)):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE usuarios SET clave = ? WHERE rut = ?", (nueva_clave, rut_trabajador))
-    conn.commit()
-    cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
-    user = cursor.fetchone()
-    conn.close()
+    try:
+        cursor.execute("UPDATE usuarios SET clave = ? WHERE rut = ?", (nueva_clave, rut_trabajador))
+        conn.commit()
+        cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
+        user = cursor.fetchone()
+    finally:
+        conn.close()
     return render_worker_dashboard(user, "Su contraseña ha sido actualizada con éxito")
 
 @app.post("/subir-documento-admin", response_class=HTMLResponse)
@@ -722,15 +762,17 @@ async def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento:
     
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO documentos (rut_trabajador, tipo_documento, nombre_archivo, ruta_archivo, origen)
-        VALUES (?, ?, ?, ?, 'admin')
-    """, (rut_trabajador, tipo_documento, archivo.filename, ruta_destino))
-    conn.commit()
-    
-    cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
-    trabajador = cursor.fetchone()
-    conn.close()
+    try:
+        cursor.execute("""
+            INSERT INTO documentos (rut_trabajador, tipo_documento, nombre_archivo, ruta_archivo, origen)
+            VALUES (?, ?, ?, ?, 'admin')
+        """, (rut_trabajador, tipo_documento, archivo.filename, ruta_destino))
+        conn.commit()
+        
+        cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
+        trabajador = cursor.fetchone()
+    finally:
+        conn.close()
     
     if trabajador and trabajador['email']:
         asunto = f"Nuevo documento pendiente de firma: {tipo_documento}"
@@ -759,36 +801,40 @@ async def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_docum
         
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO documentos (rut_trabajador, tipo_documento, nombre_archivo, ruta_archivo, origen)
-        VALUES (?, ?, ?, ?, 'trabajador')
-    """, (rut_trabajador, tipo_documento, archivo.filename, ruta_destino))
-    conn.commit()
-    cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
-    user = cursor.fetchone()
-    conn.close()
+    try:
+        cursor.execute("""
+            INSERT INTO documentos (rut_trabajador, tipo_documento, nombre_archivo, ruta_archivo, origen)
+            VALUES (?, ?, ?, ?, 'trabajador')
+        """, (rut_trabajador, tipo_documento, archivo.filename, ruta_destino))
+        conn.commit()
+        cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
+        user = cursor.fetchone()
+    finally:
+        conn.close()
     return render_worker_dashboard(user, "Documento subido con éxito")
 
 @app.post("/firmar-documento/{doc_id}", response_class=HTMLResponse)
 def firmar_documento(doc_id: int, rut_trabajador: str = Form(...), request: Request = None):
     ip_origen = request.client.host if request else "127.0.0.1"
-    fecha_hora_actual = datetime.now()
+    fecha_hora_actual = obtener_hora_chile()
     fecha_fmt = fecha_hora_actual.strftime("%d/%m/%Y %H:%M:%S")
     codigo_verificacion = hashlib.sha256(f"{doc_id}-{rut_trabajador}-{fecha_hora_actual}".encode()).hexdigest()[:12].upper()
     
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO firmas_documentos (documento_id, rut_trabajador, ip_origen, codigo_verificacion, estado)
-        VALUES (?, ?, ?, ?, 1)
-    """, (doc_id, rut_trabajador, ip_origen, codigo_verificacion))
-    conn.commit()
-    
-    cursor.execute("SELECT * FROM documentos WHERE id = ?", (doc_id,))
-    doc = cursor.fetchone()
-    cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
-    user = cursor.fetchone()
-    conn.close()
+    try:
+        cursor.execute("""
+            INSERT INTO firmas_documentos (documento_id, rut_trabajador, fecha_firma, ip_origen, codigo_verificacion, estado)
+            VALUES (?, ?, ?, ?, ?, 1)
+        """, (doc_id, rut_trabajador, fecha_hora_actual, ip_origen, codigo_verificacion))
+        conn.commit()
+        
+        cursor.execute("SELECT * FROM documentos WHERE id = ?", (doc_id,))
+        doc = cursor.fetchone()
+        cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
+        user = cursor.fetchone()
+    finally:
+        conn.close()
     
     if user and user['email']:
         asunto = f"Comprobante de Firma Electrónica - {doc['tipo_documento'] if doc else 'Documento'}"
@@ -815,40 +861,49 @@ def firmar_documento(doc_id: int, rut_trabajador: str = Form(...), request: Requ
 def anular_documento(doc_id: int, motivo: str = Form(...)):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE documentos 
-        SET anulado = 1, motivo_anulacion = ? 
-        WHERE id = ?
-    """, (motivo, doc_id))
-    conn.commit()
-    conn.close()
-    return render_admin_dashboard("Documento anulado correctamente")
+    try:
+        fecha_anulacion = obtener_hora_chile()
+        cursor.execute("""
+            UPDATE documentos 
+            SET anulado = 1, motivo_anulacion = ?, fecha_anulacion = ? 
+            WHERE id = ?
+        """, (motivo, fecha_anulacion, doc_id))
+        conn.commit()
+        return render_admin_dashboard("Documento anulado correctamente")
+    except Exception as e:
+        return render_admin_dashboard(f"Error al anular documento: {str(e)}")
+    finally:
+        conn.close()
 
 @app.get("/descargar/{doc_id}")
 def descargar_documento(doc_id: int):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT d.*, f.fecha_firma, f.codigo_verificacion 
-        FROM documentos d 
-        LEFT JOIN firmas_documentos f ON d.id = f.documento_id 
-        WHERE d.id = ?
-    """, (doc_id,))
-    doc = cursor.fetchone()
-    conn.close()
+    try:
+        cursor.execute("""
+            SELECT d.*, f.fecha_firma, f.codigo_verificacion, u.nombre as nombre_trabajador, u.rut as rut_trabajador_val
+            FROM documentos d 
+            LEFT JOIN firmas_documentos f ON d.id = f.documento_id 
+            LEFT JOIN usuarios u ON d.rut_trabajador = u.rut
+            WHERE d.id = ?
+        """, (doc_id,))
+        doc = cursor.fetchone()
+    finally:
+        conn.close()
 
     if doc and os.path.exists(doc['ruta_archivo']):
-        if doc['anulado']:
-            buffer_pdf = agregar_sello_anulado(
-                doc['ruta_archivo'], 
-                doc['motivo_anulacion'] or "Sin motivo especificado", 
-                fecha_firma=doc['fecha_firma'], 
-                codigo_verificacion=doc['codigo_verificacion']
-            )
-            return StreamingResponse(
-                buffer_pdf, 
-                media_type="application/pdf", 
-                headers={"Content-Disposition": f"inline; filename=ANULADO_{doc['nombre_archivo']}"}
-            )
-        return FileResponse(doc['ruta_archivo'], filename=doc['nombre_archivo'])
+        buffer_pdf = agregar_sello_firma_y_anulado(
+            doc['ruta_archivo'], 
+            motivo_anulado=doc['motivo_anulacion'] if doc['anulado'] else None,
+            fecha_anulacion=doc['fecha_anulacion'] if doc['anulado'] else None,
+            nombre_firmante=doc['nombre_trabajador'] if doc['codigo_verificacion'] else None,
+            rut_firmante=doc['rut_trabajador_val'] if doc['codigo_verificacion'] else None,
+            fecha_firma=doc['fecha_firma'] if doc['codigo_verificacion'] else None,
+            codigo_verificacion=doc['codigo_verificacion'] if doc['codigo_verificacion'] else None
+        )
+        return StreamingResponse(
+            buffer_pdf, 
+            media_type="application/pdf", 
+            headers={"Content-Disposition": f"inline; filename=firmado_{doc['nombre_archivo']}"}
+        )
     return HTMLResponse("Archivo no encontrado", status_code=404)
