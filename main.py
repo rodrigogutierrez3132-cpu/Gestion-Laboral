@@ -9,7 +9,8 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Form, File, UploadFile, Request
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
 from pypdf import PdfReader, PdfWriter
-from pypdf.annotations import FreeText
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 
 app = FastAPI()
 
@@ -130,43 +131,56 @@ def obtener_hora_chile():
 def agregar_sello_firma_y_anulado(ruta_pdf, motivo_anulado=None, fecha_anulacion=None, nombre_firmante=None, rut_firmante=None, fecha_firma=None, codigo_verificacion=None):
     reader = PdfReader(ruta_pdf)
     writer = PdfWriter()
-
     total_pages = len(reader.pages)
 
+    # Creamos un canvas temporal con ReportLab para dibujar los sellos fijos y visibles
+    packet = io.BytesIO()
+    can = canvas.Canvas(packet, pagesize=letter)
+    
+    # 1. Sello de firma fija en la última página
+    if nombre_firmante and rut_firmante and fecha_firma and codigo_verificacion:
+        fecha_str = str(fecha_firma)[:19]
+        can.setFillColorRGB(0.93, 0.96, 0.99) # Fondo azul claro suave
+        can.setStrokeColorRGB(0.18, 0.38, 0.57) # Borde azul corporativo
+        can.setLineWidth(1)
+        can.rect(40, 40, 525, 50, fill=1, stroke=1)
+        
+        can.setFillColorRGB(0.1, 0.2, 0.3) # Texto oscuro formal
+        can.setFont("Helvetica-Bold", 7.5)
+        can.drawString(50, 72, f"FIRMADO DIGITALMENTE POR: {nombre_firmante} (RUT: {rut_firmante})")
+        
+        can.setFont("Helvetica", 7.5)
+        can.drawString(50, 60, f"FECHA DE FIRMA: {fecha_str}")
+        can.drawString(50, 48, f"CÓDIGO DE VERIFICACIÓN: FIRMA-{codigo_verificacion}")
+
+    # 2. Sello de documento anulado en rojo (visible)
+    if motivo_anulado:
+        fecha_anul_str = str(fecha_anulacion)[:19] if fecha_anulacion else ""
+        can.setFillColorRGB(0.98, 0.93, 0.93) # Fondo rojo muy suave
+        can.setStrokeColorRGB(0.85, 0.32, 0.31) # Borde rojo alerta
+        can.setLineWidth(1.5)
+        can.rect(100, 350, 415, 80, fill=1, stroke=1)
+        
+        can.setFillColorRGB(0.85, 0.32, 0.31) # Texto rojo fuerte
+        can.setFont("Helvetica-Bold", 16)
+        can.drawString(120, 395, "DOCUMENTO ANULADO")
+        
+        can.setFont("Helvetica-Bold", 8.5)
+        can.drawString(120, 378, f"FECHA: {fecha_anul_str}")
+        can.setFont("Helvetica", 8.5)
+        can.drawString(120, 362, f"MOTIVO: {motivo_anulado}")
+
+    can.save()
+    packet.seek(0)
+    pdf_firma = PdfReader(packet)
+    overlay_page = pdf_firma.pages[0] if len(pdf_firma.pages) > 0 else None
+
     for index, page in enumerate(reader.pages):
+        # Fusionamos los sellos fijos en la última página
+        if index == total_pages - 1 and overlay_page and (nombre_firmante or motivo_anulado):
+            page.merge_page(overlay_page)
+        
         writer.add_page(page)
-        page_num = len(writer.pages) - 1
-
-        # Ajustado para estampar únicamente en la última página y con coordenadas seguras dentro del margen visible
-        if index == total_pages - 1 and nombre_firmante and rut_firmante and fecha_firma and codigo_verificacion:
-            fecha_str = str(fecha_firma)[:19]
-            texto_firma = (
-                f"FIRMADO DIGITALMENTE POR: {nombre_firmante} (RUT: {rut_firmante})\n"
-                f"FECHA DE FIRMA: {fecha_str}\n"
-                f"CÓDIGO DE VERIFICACIÓN: FIRMA-{codigo_verificacion}"
-            )
-            anotacion_firma = FreeText(
-                text=texto_firma,
-                rect=(50, 100, 500, 170),
-                font_size="8pt",
-                font_color="1B4F72",
-                border_color="2E86C1",
-                background_color="EBF5FB"
-            )
-            writer.add_annotation(page_number=page_num, annotation=anotacion_firma)
-
-        if motivo_anulado:
-            fecha_anul_str = str(fecha_anulacion)[:19] if fecha_anulacion else ""
-            texto_sello = f"DOCUMENTO ANULADO\nFECHA: {fecha_anul_str}\nMOTIVO: {motivo_anulado}"
-            anotacion_anulado = FreeText(
-                text=texto_sello,
-                rect=(320, 250, 570, 600),
-                font_size="24pt",
-                font_color="D9534F",
-                border_color="D9534F",
-                background_color="FDF2F2"
-            )
-            writer.add_annotation(page_number=page_num, annotation=anotacion_anulado)
 
     buffer = io.BytesIO()
     writer.write(buffer)
@@ -883,4 +897,3 @@ def descargar_documento(doc_id: int):
             headers={"Content-Disposition": f"inline; filename=firmado_{doc['nombre_archivo']}"}
         )
     return HTMLResponse("Archivo no encontrado", status_code=404)
-
