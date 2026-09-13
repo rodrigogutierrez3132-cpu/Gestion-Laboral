@@ -1,3 +1,4 @@
+           
 import sqlite3
 import os
 import hashlib
@@ -97,6 +98,18 @@ def init_db():
         )
     """)
     
+    # Tabla para el Registro de Auditoría / Trazabilidad exigido por normativa
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_hora TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            rut_usuario TEXT,
+            accion TEXT NOT NULL,
+            detalles TEXT,
+            ip_address TEXT
+        )
+    """)
+    
     try:
         cursor.execute("ALTER TABLE usuarios ADD COLUMN email TEXT")
     except sqlite3.OperationalError:
@@ -128,24 +141,37 @@ def obtener_hora_chile():
     chile_time = utc_now - timedelta(hours=3)
     return chile_time.replace(tzinfo=None)
 
+# Función auxiliar para registrar eventos de auditoría y trazabilidad
+def registrar_auditoria(db, rut_usuario: str, accion: str, detalles: str, req: Request = None):
+    try:
+        ip_address = "127.0.0.1"
+        if req and req.client:
+            ip_address = req.client.host
+        cursor = db.cursor()
+        cursor.execute("""
+            INSERT INTO audit_logs (fecha_hora, rut_usuario, accion, detalles, ip_address)
+            VALUES (?, ?, ?, ?, ?)
+        """, (obtener_hora_chile(), rut_usuario, accion, detalles, ip_address))
+        db.commit()
+    except Exception as e:
+        print(f"[ERROR AUDITORIA]: {e}")
+
 def agregar_sello_firma_y_anulado(ruta_pdf, motivo_anulado=None, fecha_anulacion=None, nombre_firmante=None, rut_firmante=None, fecha_firma=None, codigo_verificacion=None):
     reader = PdfReader(ruta_pdf)
     writer = PdfWriter()
     total_pages = len(reader.pages)
 
-    # Creamos un canvas temporal con ReportLab para dibujar los sellos fijos y visibles
     packet = io.BytesIO()
     can = canvas.Canvas(packet, pagesize=letter)
     
-    # 1. Sello de firma fija en la última página
     if nombre_firmante and rut_firmante and fecha_firma and codigo_verificacion:
         fecha_str = str(fecha_firma)[:19]
-        can.setFillColorRGB(0.93, 0.96, 0.99) # Fondo azul claro suave
-        can.setStrokeColorRGB(0.18, 0.38, 0.57) # Borde azul corporativo
+        can.setFillColorRGB(0.93, 0.96, 0.99)
+        can.setStrokeColorRGB(0.18, 0.38, 0.57)
         can.setLineWidth(1)
         can.rect(40, 40, 525, 50, fill=1, stroke=1)
         
-        can.setFillColorRGB(0.1, 0.2, 0.3) # Texto oscuro formal
+        can.setFillColorRGB(0.1, 0.2, 0.3)
         can.setFont("Helvetica-Bold", 7.5)
         can.drawString(50, 72, f"FIRMADO DIGITALMENTE POR: {nombre_firmante} (RUT: {rut_firmante})")
         
@@ -153,15 +179,14 @@ def agregar_sello_firma_y_anulado(ruta_pdf, motivo_anulado=None, fecha_anulacion
         can.drawString(50, 60, f"FECHA DE FIRMA: {fecha_str}")
         can.drawString(50, 48, f"CÓDIGO DE VERIFICACIÓN: FIRMA-{codigo_verificacion}")
 
-    # 2. Sello de documento anulado en rojo (visible)
     if motivo_anulado:
         fecha_anul_str = str(fecha_anulacion)[:19] if fecha_anulacion else ""
-        can.setFillColorRGB(0.98, 0.93, 0.93) # Fondo rojo muy suave
-        can.setStrokeColorRGB(0.85, 0.32, 0.31) # Borde rojo alerta
+        can.setFillColorRGB(0.98, 0.93, 0.93)
+        can.setStrokeColorRGB(0.85, 0.32, 0.31)
         can.setLineWidth(1.5)
         can.rect(100, 350, 415, 80, fill=1, stroke=1)
         
-        can.setFillColorRGB(0.85, 0.32, 0.31) # Texto rojo fuerte
+        can.setFillColorRGB(0.85, 0.32, 0.31)
         can.setFont("Helvetica-Bold", 16)
         can.drawString(120, 395, "DOCUMENTO ANULADO")
         
@@ -176,10 +201,8 @@ def agregar_sello_firma_y_anulado(ruta_pdf, motivo_anulado=None, fecha_anulacion
     overlay_page = pdf_firma.pages[0] if len(pdf_firma.pages) > 0 else None
 
     for index, page in enumerate(reader.pages):
-        # Fusionamos los sellos fijos en la última página
         if index == total_pages - 1 and overlay_page and (nombre_firmante or motivo_anulado):
             page.merge_page(overlay_page)
-        
         writer.add_page(page)
 
     buffer = io.BytesIO()
@@ -188,32 +211,44 @@ def agregar_sello_firma_y_anulado(ruta_pdf, motivo_anulado=None, fecha_anulacion
     return buffer
 
 @app.get("/eliminar-documento-dt/{id_doc}", response_class=HTMLResponse)
-def eliminar_documento_dt_get(id_doc: int):
+def eliminar_documento_dt_get(id_doc: int, request: Request):
     conn = get_db()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT ruta_archivo FROM documentos WHERE id = ?", (id_doc,))
+        cursor.execute("SELECT * FROM documentos WHERE id = ?", (id_doc,))
         doc = cursor.fetchone()
+        if not doc:
+            return render_admin_dashboard("El documento no existe")
+        
+        cursor.execute("SELECT * FROM firmas_documentos WHERE documento_id = ? AND estado = 1", (id_doc,))
+        firma_existente = cursor.fetchone()
+        if firma_existente or doc['anulado']:
+            return render_admin_dashboard("Error normativo DT: No se pueden eliminar documentos firmados o anulados.")
+
         if doc and os.path.exists(doc['ruta_archivo']):
             os.remove(doc['ruta_archivo'])
+        
+        registrar_auditoria(conn, "admin", "ELIMINAR_DOCUMENTO_ADMIN", f"Se eliminó el documento ID {id_doc} ({doc['nombre_archivo']}) que estaba pendiente.", request)
+        
         cursor.execute("DELETE FROM firmas_documentos WHERE documento_id = ?", (id_doc,))
         cursor.execute("DELETE FROM documentos WHERE id = ?", (id_doc,))
         conn.commit()
-        return render_admin_dashboard("Documento eliminado correctamente")
+        return render_admin_dashboard("Documento pendiente eliminado correctamente")
     except Exception as e:
         return render_admin_dashboard(f"Error al eliminar documento: {str(e)}")
     finally:
         conn.close()
 
 @app.get("/eliminar-documento-trabajador/{id_doc}", response_class=HTMLResponse)
-def eliminar_documento_trabajador_get(id_doc: int):
+def eliminar_documento_trabajador_get(id_doc: int, request: Request):
     conn = get_db()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT ruta_archivo FROM documentos WHERE id = ?", (id_doc,))
+        cursor.execute("SELECT * FROM documentos WHERE id = ?", (id_doc,))
         doc = cursor.fetchone()
         if doc and os.path.exists(doc['ruta_archivo']):
             os.remove(doc['ruta_archivo'])
+        registrar_auditoria(conn, "admin", "ELIMINAR_DOCUMENTO_TRABAJADOR", f"Administrador eliminó archivo libre de trabajador ID {id_doc}", request)
         cursor.execute("DELETE FROM documentos WHERE id = ?", (id_doc,))
         conn.commit()
         return render_admin_dashboard("Documento subido por trabajador eliminado correctamente")
@@ -254,12 +289,37 @@ def render_worker_dashboard(user, mensaje=""):
             accion = f"<a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver Documento Firmado</a>"
         else:
             estado = "<span class='badge bg-warning text-dark'>Pendiente de Firma</span>"
+            # MODIFICACIÓN SOLICITADA: Primero revisa el PDF, luego pincha firmar y aparece la leyenda con el botón de confirmación
             accion = f"""
-                <form action='/firmar-documento/{d['id']}' method='post' class='d-inline'>
-                    <input type='hidden' name='rut_trabajador' value='{user['rut']}'>
-                    <button type='submit' class='btn btn-sm btn-success' onclick='return confirm("¿Declara haber leído y firmado electrónicamente este documento?")'>Firmar Documento</button>
-                </form>
-                <a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-secondary ms-1' target='_blank'>Revisar PDF</a>
+                <a href='/descargar/{d['id']}' class='btn btn-sm btn-outline-secondary me-1' target='_blank'>Revisar PDF</a>
+                <button class='btn btn-sm btn-success' data-bs-toggle='modal' data-bs-target='#modalFirmar{d['id']}'>Firmar Documento</button>
+                
+                <div class="modal fade text-start" id="modalFirmar{d['id']}" tabindex="-1" aria-hidden="true">
+                  <div class="modal-dialog">
+                    <div class="modal-content">
+                      <div class="modal-header bg-success text-white">
+                        <h5 class="modal-title fw-bold">Confirmación de Firma Electrónica</h5>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                      </div>
+                      <form action='/firmar-documento/{d['id']}' method='post'>
+                          <div class="modal-body">
+                            <input type='hidden' name='rut_trabajador' value='{user['rut']}'>
+                            <p class="small text-secondary">Está a punto de firmar el documento: <b>{d['nombre_archivo']}</b></p>
+                            <div class="form-check p-3 bg-light rounded border mb-3">
+                                <input class='form-check-input' type='checkbox' id='terminos_{d['id']}' required>
+                                <label class='form-check-label fw-bold' style='font-size: 0.85rem;' for='terminos_{d['id']}'>
+                                    Acepto firmar mediante Firma Electrónica Simple reconociendo mi autoría.
+                                </label>
+                            </div>
+                          </div>
+                          <div class="modal-footer">
+                            <button type='button' class='btn btn-secondary btn-sm' data-bs-dismiss='modal'>Cancelar</button>
+                            <button type='submit' class='btn btn-success btn-sm'>Confirmar y Firmar Documento</button>
+                          </div>
+                      </form>
+                    </div>
+                  </div>
+                </div>
             """
 
         filas_por_firmar += f"""
@@ -461,17 +521,18 @@ def render_admin_dashboard(mensaje=""):
             estado_firma = f"<span class='badge bg-danger'>Anulado</span><br><small class='text-muted'>Motivo: {d['motivo_anulacion'] or ''}</small>"
             btn_ver = f"<a href='/descargar/{doc_id}' class='btn btn-sm btn-outline-danger' target='_blank'>Ver PDF Anulado</a>"
             btn_accion_anular = ""
+            btn_eliminar_dt = ""
         elif d['estado']:
             fecha_fmt = str(d['fecha_firma'])[:16] if d['fecha_firma'] else ""
             estado_firma = f"<span class='badge bg-success'>Firmado ({fecha_fmt})<br><small>Cód: {d['codigo_verificacion']}</small></span>"
             btn_ver = f"<a href='/descargar/{doc_id}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver PDF</a>"
             btn_accion_anular = f"<button class='btn btn-sm btn-outline-danger ms-1' data-bs-toggle='modal' data-bs-target='#anularModal{doc_id}'>Anular</button>"
+            btn_eliminar_dt = f"<span class='d-inline-block text-muted small ms-1' title='Norma DT: No se puede eliminar un documento ya firmado'>Eliminar (Bloqueado)</span>"
         else:
             estado_firma = "<span class='badge bg-warning text-dark'>Pendiente de Firma</span>"
             btn_ver = f"<a href='/descargar/{doc_id}' class='btn btn-sm btn-outline-primary' target='_blank'>Ver PDF</a>"
             btn_accion_anular = f"<button class='btn btn-sm btn-outline-danger ms-1' data-bs-toggle='modal' data-bs-target='#anularModal{doc_id}'>Anular</button>"
-
-        btn_eliminar_dt = f"<a href='/eliminar-documento-dt/{doc_id}' class='btn btn-sm btn-danger ms-1' onclick='return confirm(\"¿Estás seguro de eliminar este documento?\")'>Eliminar</a>"
+            btn_eliminar_dt = f"<a href='/eliminar-documento-dt/{doc_id}' class='btn btn-sm btn-danger ms-1' onclick='return confirm(\"¿Estás seguro de eliminar este documento pendiente?\")'>Eliminar</a>"
 
         filas_docs_admin += (
             "<tr>"
@@ -666,20 +727,125 @@ def login_page():
                     <label class="form-label small">Contraseña</label>
                     <input type="password" name="clave" class="form-control" required>
                 </div>
-                <button type="submit" class="btn btn-primary w-100">Ingresar</button>
+                <button type="submit" class="btn btn-primary w-100 mb-3">Ingresar</button>
             </form>
+            <div class="text-center">
+                <a href="/verificar" class="small text-decoration-none">🔍 Verificar Documento por Código</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.get("/verificar", response_class=HTMLResponse)
+def verificar_codigo_form():
+    return """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <title>Verificar Documento por Código</title>
+    </head>
+    <body class="bg-light d-flex align-items-center justify-content-center vh-100">
+        <div class="card p-4 shadow" style="width: 450px;">
+            <h4 class="text-center mb-3 text-primary fw-bold">Verificador de Autenticidad</h4>
+            <p class="text-muted small text-center mb-4">Ingrese el código de verificación que aparece en el documento para comprobar su validez y descargar una copia.</p>
+            <form action="/verificar-codigo" method="post">
+                <div class="mb-3">
+                    <label class="form-label small fw-bold">Código de Verificación</label>
+                    <input type="text" name="codigo" class="form-control text-uppercase" placeholder="Ej: 8D62094D6C07" required>
+                </div>
+                <button type="submit" class="btn btn-success w-100 mb-2">Verificar Documento</button>
+            </form>
+            <div class="text-center mt-3">
+                <a href="/" class="small text-decoration-none">← Volver al inicio de sesión</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.post("/verificar-codigo", response_class=HTMLResponse)
+def verificar_codigo_post(codigo: str = Form(...)):
+    codigo_limpio = codigo.strip().upper().replace("FIRMA-", "")
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT d.*, f.fecha_firma, f.codigo_verificacion, u.nombre as nombre_trabajador, u.rut as rut_trabajador_val
+            FROM firmas_documentos f
+            JOIN documentos d ON f.documento_id = d.id
+            LEFT JOIN usuarios u ON d.rut_trabajador = u.rut
+            WHERE f.codigo_verificacion = ?
+        """, (codigo_limpio,))
+        resultado = cursor.fetchone()
+    finally:
+        conn.close()
+
+    if not resultado:
+        return """
+        <!DOCTYPE html>
+        <html lang="es">
+        <head>
+            <meta charset="UTF-8">
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+            <title>Código No Válido</title>
+        </head>
+        <body class="bg-light d-flex align-items-center justify-content-center vh-100">
+            <div class="card p-4 shadow text-center" style="width: 400px;">
+                <div class="mb-3 text-danger fs-1">❌</div>
+                <h4 class="text-danger fw-bold mb-2">Código No Encontrado</h4>
+                <p class="text-muted small mb-4">El código ingresado no corresponde a ningún documento válido emitido por el sistema.</p>
+                <a href="/verificar" class="btn btn-primary btn-sm">Intentar con otro código</a>
+            </div>
+        </body>
+        </html>
+        """
+
+    estado_anulado = "<span class='text-danger fw-bold'>ESTE DOCUMENTO SE ENCUENTRA ANULADO</span>" if resultado['anulado'] else "<span class='text-success fw-bold'>Documento Vigente y Firmado Correctamente</span>"
+    fecha_fmt = str(resultado['fecha_firma'])[:19]
+    
+    return f"""
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <title>Resultado de Verificación</title>
+    </head>
+    <body class="bg-light p-4 d-flex align-items-center justify-content-center vh-100">
+        <div class="card p-4 shadow" style="width: 550px;">
+            <h4 class="text-center text-success mb-3">✔️ Código Válido</h4>
+            <hr>
+            <p class="small mb-2">{estado_anulado}</p>
+            <ul class="list-group list-group-flush mb-4 small">
+                <li class="list-group-item"><b>Trabajador:</b> {resultado['nombre_trabajador']} (RUT: {resultado['rut_trabajador_val']})</li>
+                <li class="list-group-item"><b>Tipo de Documento:</b> {resultado['tipo_documento']}</li>
+                <li class="list-group-item"><b>Archivo Original:</b> {resultado['nombre_archivo']}</li>
+                <li class="list-group-item"><b>Fecha de Firma:</b> {fecha_fmt}</li>
+                <li class="list-group-item"><b>Código Verificador:</b> <code>{resultado['codigo_verificacion']}</code></li>
+            </ul>
+            <div class="d-flex justify-content-between">
+                <a href="/descargar/{resultado['id']}" class="btn btn-primary btn-sm w-100 me-2" target="_blank">Descargar Copia del Documento PDF</a>
+                <a href="/verificar" class="btn btn-secondary btn-sm">Nueva Consulta</a>
+            </div>
         </div>
     </body>
     </html>
     """
 
 @app.post("/login", response_class=HTMLResponse)
-def login(rut: str = Form(...), clave: str = Form(...)):
+def login(rut: str = Form(...), clave: str = Form(...), request: Request = None):
     conn = get_db()
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT * FROM usuarios WHERE rut = ? AND clave = ?", (rut, clave))
         user = cursor.fetchone()
+        if user:
+            registrar_auditoria(conn, rut, "LOGIN_EXITOSO", f"Usuario {rut} inició sesión correctamente.", request)
+        else:
+            registrar_auditoria(conn, rut, "LOGIN_FALLIDO", f"Intento fallido de inicio de sesión para el RUT: {rut}.", request)
     finally:
         conn.close()
 
@@ -691,12 +857,13 @@ def login(rut: str = Form(...), clave: str = Form(...)):
         return render_worker_dashboard(user)
 
 @app.post("/crear-trabajador", response_class=HTMLResponse)
-def crear_trabajador(rut: str = Form(...), nombre: str = Form(...), email: str = Form(...), clave: str = Form(...)):
+def crear_trabajador(rut: str = Form(...), nombre: str = Form(...), email: str = Form(...), clave: str = Form(...), request: Request = None):
     conn = get_db()
     cursor = conn.cursor()
     try:
         cursor.execute("INSERT INTO usuarios (rut, nombre, email, clave, rol) VALUES (?, ?, ?, ?, 'trabajador')", (rut, nombre, email, clave))
         conn.commit()
+        registrar_auditoria(conn, "admin", "CREAR_TRABAJADOR", f"Se registró al trabajador {nombre} ({rut})", request)
         return render_admin_dashboard("Trabajador creado exitosamente")
     except Exception as e:
         return render_admin_dashboard(f"Error al crear trabajador: {str(e)}")
@@ -704,12 +871,17 @@ def crear_trabajador(rut: str = Form(...), nombre: str = Form(...), email: str =
         conn.close()
 
 @app.get("/eliminar-trabajador/{user_id}", response_class=HTMLResponse)
-def eliminar_trabajador(user_id: int):
+def eliminar_trabajador(user_id: int, request: Request):
     conn = get_db()
     cursor = conn.cursor()
     try:
+        cursor.execute("SELECT rut FROM usuarios WHERE id = ?", (user_id,))
+        u = cursor.fetchone()
+        rut_afectado = u['rut'] if u else str(user_id)
+        
         cursor.execute("DELETE FROM usuarios WHERE id = ?", (user_id,))
         conn.commit()
+        registrar_auditoria(conn, "admin", "ELIMINAR_TRABAJADOR", f"Se eliminó al trabajador con ID {user_id} (RUT: {rut_afectado})", request)
         return render_admin_dashboard("Trabajador eliminado exitosamente")
     except Exception as e:
         return render_admin_dashboard(f"Error al eliminar trabajador: {str(e)}")
@@ -717,12 +889,13 @@ def eliminar_trabajador(user_id: int):
         conn.close()
 
 @app.post("/editar-trabajador/{user_id}", response_class=HTMLResponse)
-def editar_trabajador(user_id: int, nombre: str = Form(...), email: str = Form(...), clave: str = Form(...)):
+def editar_trabajador(user_id: int, nombre: str = Form(...), email: str = Form(...), clave: str = Form(...), request: Request = None):
     conn = get_db()
     cursor = conn.cursor()
     try:
         cursor.execute("UPDATE usuarios SET nombre = ?, email = ?, clave = ? WHERE id = ?", (nombre, email, clave, user_id))
         conn.commit()
+        registrar_auditoria(conn, "admin", "EDITAR_TRABAJADOR", f"Se actualizaron datos del trabajador ID {user_id}", request)
         return render_admin_dashboard("Datos y/o contraseña de trabajador actualizados")
     except Exception as e:
         return render_admin_dashboard(f"Error al actualizar trabajador: {str(e)}")
@@ -730,12 +903,13 @@ def editar_trabajador(user_id: int, nombre: str = Form(...), email: str = Form(.
         conn.close()
 
 @app.post("/cambiar-clave-trabajador", response_class=HTMLResponse)
-def cambiar_clave_trabajador(rut_trabajador: str = Form(...), nueva_clave: str = Form(...)):
+def cambiar_clave_trabajador(rut_trabajador: str = Form(...), nueva_clave: str = Form(...), request: Request = None):
     conn = get_db()
     cursor = conn.cursor()
     try:
         cursor.execute("UPDATE usuarios SET clave = ? WHERE rut = ?", (nueva_clave, rut_trabajador))
         conn.commit()
+        registrar_auditoria(conn, rut_trabajador, "CAMBIO_CLAVE", f"El trabajador {rut_trabajador} actualizó su contraseña.", request)
         cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
         user = cursor.fetchone()
     finally:
@@ -743,7 +917,7 @@ def cambiar_clave_trabajador(rut_trabajador: str = Form(...), nueva_clave: str =
     return render_worker_dashboard(user, "Su contraseña ha sido actualizada con éxito")
 
 @app.post("/subir-documento-admin", response_class=HTMLResponse)
-async def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
+async def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...), request: Request = None):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     ruta_destino = os.path.join(UPLOAD_DIR, archivo.filename)
     contenido = await archivo.read()
@@ -758,6 +932,8 @@ async def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento:
             VALUES (?, ?, ?, ?, 'admin')
         """, (rut_trabajador, tipo_documento, archivo.filename, ruta_destino))
         conn.commit()
+        
+        registrar_auditoria(conn, "admin", "DOCUMENTO_SUBIDO_ADMIN", f"Se subió documento '{tipo_documento}' ({archivo.filename}) para el RUT {rut_trabajador}", request)
         
         cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
         trabajador = cursor.fetchone()
@@ -782,7 +958,7 @@ async def subir_documento_admin(rut_trabajador: str = Form(...), tipo_documento:
     return render_admin_dashboard("Documento subido y notificación enviada al trabajador")
 
 @app.post("/subir-documento-trabajador", response_class=HTMLResponse)
-async def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...)):
+async def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_documento: str = Form(...), archivo: UploadFile = File(...), request: Request = None):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     ruta_destino = os.path.join(UPLOAD_DIR, archivo.filename)
     contenido = await archivo.read()
@@ -797,6 +973,7 @@ async def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_docum
             VALUES (?, ?, ?, ?, 'trabajador')
         """, (rut_trabajador, tipo_documento, archivo.filename, ruta_destino))
         conn.commit()
+        registrar_auditoria(conn, rut_trabajador, "DOCUMENTO_SUBIDO_TRABAJADOR", f"Trabajador subió archivo '{tipo_documento}' ({archivo.filename})", request)
         cursor.execute("SELECT * FROM usuarios WHERE rut = ?", (rut_trabajador,))
         user = cursor.fetchone()
     finally:
@@ -805,7 +982,7 @@ async def subir_documento_trabajador(rut_trabajador: str = Form(...), tipo_docum
 
 @app.post("/firmar-documento/{doc_id}", response_class=HTMLResponse)
 def firmar_documento(doc_id: int, rut_trabajador: str = Form(...), request: Request = None):
-    ip_origen = request.client.host if request else "127.0.0.1"
+    ip_origen = request.client.host if request and request.client else "127.0.0.1"
     fecha_hora_actual = obtener_hora_chile()
     fecha_fmt = fecha_hora_actual.strftime("%d/%m/%Y %H:%M:%S")
     codigo_verificacion = hashlib.sha256(f"{doc_id}-{rut_trabajador}-{fecha_hora_actual}".encode()).hexdigest()[:12].upper()
@@ -818,6 +995,8 @@ def firmar_documento(doc_id: int, rut_trabajador: str = Form(...), request: Requ
             VALUES (?, ?, ?, ?, ?, 1)
         """, (doc_id, rut_trabajador, fecha_hora_actual, ip_origen, codigo_verificacion))
         conn.commit()
+        
+        registrar_auditoria(conn, rut_trabajador, "DOCUMENTO_FIRMADO", f"Documento ID {doc_id} firmado con éxito. Cód: {codigo_verificacion}", request)
         
         cursor.execute("SELECT * FROM documentos WHERE id = ?", (doc_id,))
         doc = cursor.fetchone()
@@ -848,7 +1027,7 @@ def firmar_documento(doc_id: int, rut_trabajador: str = Form(...), request: Requ
     return render_worker_dashboard(user, f"Documento firmado electrónicamente (Código: {codigo_verificacion}). Se ha enviado un comprobante a tu correo.")
 
 @app.post("/anular-documento/{doc_id}", response_class=HTMLResponse)
-def anular_documento(doc_id: int, motivo: str = Form(...)):
+def anular_documento(doc_id: int, motivo: str = Form(...), request: Request = None):
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -859,6 +1038,7 @@ def anular_documento(doc_id: int, motivo: str = Form(...)):
             WHERE id = ?
         """, (motivo, fecha_anulacion, doc_id))
         conn.commit()
+        registrar_auditoria(conn, "admin", "DOCUMENTO_ANULADO", f"Se anuló el documento ID {doc_id}. Motivo: {motivo}", request)
         return render_admin_dashboard("Documento anulado correctamente")
     except Exception as e:
         return render_admin_dashboard(f"Error al anular documento: {str(e)}")
