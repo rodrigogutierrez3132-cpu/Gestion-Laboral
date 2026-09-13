@@ -2,4 +2,4 @@ fastapi
 uvicorn
 pypdf
 reportlab
-Python-multipart
+python-multipart
