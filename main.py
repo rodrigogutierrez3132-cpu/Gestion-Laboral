@@ -131,11 +131,14 @@ def agregar_sello_firma_y_anulado(ruta_pdf, motivo_anulado=None, fecha_anulacion
     reader = PdfReader(ruta_pdf)
     writer = PdfWriter()
 
+    total_pages = len(reader.pages)
+
     for index, page in enumerate(reader.pages):
         writer.add_page(page)
         page_num = len(writer.pages) - 1
 
-        if nombre_firmante and rut_firmante and fecha_firma and codigo_verificacion:
+        # Ajustado para estampar únicamente en la última página y con coordenadas seguras dentro del margen visible
+        if index == total_pages - 1 and nombre_firmante and rut_firmante and fecha_firma and codigo_verificacion:
             fecha_str = str(fecha_firma)[:19]
             texto_firma = (
                 f"FIRMADO DIGITALMENTE POR: {nombre_firmante} (RUT: {rut_firmante})\n"
@@ -144,7 +147,7 @@ def agregar_sello_firma_y_anulado(ruta_pdf, motivo_anulado=None, fecha_anulacion
             )
             anotacion_firma = FreeText(
                 text=texto_firma,
-                rect=(50, 50, 450, 110),
+                rect=(50, 100, 500, 170),
                 font_size="8pt",
                 font_color="1B4F72",
                 border_color="2E86C1",
@@ -880,3 +883,4 @@ def descargar_documento(doc_id: int):
             headers={"Content-Disposition": f"inline; filename=firmado_{doc['nombre_archivo']}"}
         )
     return HTMLResponse("Archivo no encontrado", status_code=404)
+
